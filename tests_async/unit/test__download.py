@@ -618,6 +618,219 @@ class TestChunkedDownload(object):
 
         exc_info.match("virtual")
 
+    def test_constructor_strict_default(self):
+        download = _download.ChunkedDownload(EXAMPLE_URL, 256, None)
+        assert not download.strict
+        assert not download._strict
+
+    def test_constructor_strict_enabled(self):
+        download = _download.ChunkedDownload(EXAMPLE_URL, 256, None, strict=True)
+        assert download.strict
+        assert download._strict
+        # Make sure we cannot set it on public @property.
+        with pytest.raises(AttributeError):
+            download.strict = False
+
+
+class TestChunkedDownloadStrict(object):
+    """Strict concatenation mode, downloading bytes 10-19 of a resource."""
+
+    START = 10
+    END = 19
+    TOTAL_BYTES = 30
+    DATA = b"0123456789"
+
+    @staticmethod
+    def _response_content_range(start_byte, end_byte, total_bytes):
+        return "bytes {:d}-{:d}/{:d}".format(start_byte, end_byte, total_bytes)
+
+    def _mock_response(self, start_byte, end_byte, total_bytes, content):
+        headers = {
+            "content-length": "{:d}".format(len(content)),
+            "content-range": self._response_content_range(
+                start_byte, end_byte, total_bytes
+            ),
+        }
+        content_stream = mock.AsyncMock(spec=["__call__", "read"])
+        content_stream.read = mock.AsyncMock(spec=["__call__"], return_value=content)
+        return mock.AsyncMock(
+            content=content_stream,
+            headers=headers,
+            status=int(http.client.PARTIAL_CONTENT),
+            spec=["__call__", "_content", "headers", "status"],
+        )
+
+    def _make_download(self, chunk_size):
+        stream = io.BytesIO()
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL,
+            chunk_size,
+            stream,
+            start=self.START,
+            end=self.END,
+            strict=True,
+        )
+        _fix_up_virtual(download)
+        return download, stream
+
+    @pytest.mark.asyncio
+    async def test_short_chunk_resumes_from_actual_end(self):
+        download, stream = self._make_download(chunk_size=10)
+        # The first request asks for the whole 10-19 range.
+        _, _, _, headers = download._prepare_request()
+        assert headers["range"] == "bytes=10-19"
+        # The gateway only returns the first half of the range.
+        response = self._mock_response(10, 14, self.TOTAL_BYTES, self.DATA[:5])
+        await download._process_response(response)
+        assert not download.finished
+        assert download.bytes_downloaded == 5
+        assert stream.getvalue() == self.DATA[:5]
+        # The follow-up request resumes from the actual end of the data.
+        curr_start, curr_end = download._get_byte_range()
+        assert (curr_start, curr_end) == (15, 19)
+        _, _, _, headers = download._prepare_request()
+        assert headers["range"] == "bytes=15-19"
+        # The remainder completes the requested range.
+        response = self._mock_response(15, 19, self.TOTAL_BYTES, self.DATA[5:])
+        await download._process_response(response)
+        assert download.finished
+        assert download.bytes_downloaded == 10
+        assert stream.getvalue() == self.DATA
+
+    @pytest.mark.asyncio
+    async def test_middle_hole_raises(self):
+        download, stream = self._make_download(chunk_size=10)
+        response = self._mock_response(10, 14, self.TOTAL_BYTES, self.DATA[:5])
+        await download._process_response(response)
+        # The gateway skips bytes 15-16 and resumes at 17.
+        response = self._mock_response(17, 19, self.TOTAL_BYTES, self.DATA[7:])
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download._process_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert error.args[1] == "Expected start byte"
+        assert error.args[2] == 15
+        assert error.args[3] == "Received start byte"
+        assert error.args[4] == 17
+        # The error message locates the gap via the received content.
+        assert "received resource bytes 10-14" in error.args[0]
+        # The hole is not silently concatenated: state is unchanged and
+        # only the contiguous prefix has been written to the stream.
+        assert download.invalid
+        assert not download.finished
+        assert download.bytes_downloaded == 5
+        assert stream.getvalue() == self.DATA[:5]
+
+    @pytest.mark.asyncio
+    async def test_read_to_object_end(self):
+        chunk_size = 4
+        download, stream = self._make_download(chunk_size=chunk_size)
+        total_bytes = 20  # The requested range ends at the object end.
+        chunks = [(10, 13), (14, 17), (18, 19)]
+        for start_byte, end_byte in chunks:
+            _, _, _, headers = download._prepare_request()
+            assert headers["range"] == "bytes={:d}-{:d}".format(start_byte, end_byte)
+            data = self.DATA[start_byte - self.START : end_byte - self.START + 1]
+            response = self._mock_response(start_byte, end_byte, total_bytes, data)
+            await download._process_response(response)
+
+        assert download.finished
+        assert download.bytes_downloaded == 10
+        assert download.total_bytes == total_bytes
+        assert stream.getvalue() == self.DATA
+
+    @pytest.mark.asyncio
+    async def test_duplicate_prefix_raises(self):
+        download, stream = self._make_download(chunk_size=10)
+        response = self._mock_response(10, 14, self.TOTAL_BYTES, self.DATA[:5])
+        await download._process_response(response)
+        # The gateway re-sends the first half of the range.
+        response = self._mock_response(10, 14, self.TOTAL_BYTES, self.DATA[:5])
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download._process_response(response)
+
+        error = exc_info.value
+        assert error.args[2] == 15
+        assert error.args[4] == 10
+        assert "received resource bytes 10-14" in error.args[0]
+        assert download.invalid
+        assert download.bytes_downloaded == 5
+        assert stream.getvalue() == self.DATA[:5]
+
+    @pytest.mark.asyncio
+    async def test_total_bytes_changed_raises(self):
+        download, stream = self._make_download(chunk_size=10)
+        response = self._mock_response(10, 14, self.TOTAL_BYTES, self.DATA[:5])
+        await download._process_response(response)
+        # The gateway reports a different total length on the next chunk.
+        response = self._mock_response(15, 19, self.TOTAL_BYTES + 1, self.DATA[5:])
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download._process_response(response)
+
+        error = exc_info.value
+        assert error.args[1] == "Expected total bytes"
+        assert error.args[2] == self.TOTAL_BYTES
+        assert error.args[3] == "Received total bytes"
+        assert error.args[4] == self.TOTAL_BYTES + 1
+        assert "received resource bytes 10-14" in error.args[0]
+        assert download.invalid
+        assert download.bytes_downloaded == 5
+        assert stream.getvalue() == self.DATA[:5]
+
+    @pytest.mark.asyncio
+    async def test_body_length_mismatch_raises(self):
+        download, stream = self._make_download(chunk_size=10)
+        # With chunked transfer encoding there is no content-length header
+        # to cross-check, and the content-range claims 10 bytes but the
+        # body only has 6.
+        response = self._mock_response(10, 19, self.TOTAL_BYTES, self.DATA[:6])
+        response.headers["transfer-encoding"] = "chunked"
+        del response.headers["content-length"]
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download._process_response(response)
+
+        error = exc_info.value
+        assert error.args[0] == "Response body is different size than content-range"
+        assert error.args[2] == 10
+        assert error.args[4] == 6
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert stream.getvalue() == b""
+
+    @pytest.mark.asyncio
+    async def test_first_response_misaligned_raises(self):
+        download, stream = self._make_download(chunk_size=10)
+        # The very first response does not start at the requested offset.
+        response = self._mock_response(0, 9, self.TOTAL_BYTES, self.DATA)
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download._process_response(response)
+
+        error = exc_info.value
+        assert error.args[2] == 10
+        assert error.args[4] == 0
+        assert "no bytes received yet" in error.args[0]
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert stream.getvalue() == b""
+
+    @pytest.mark.asyncio
+    async def test_non_strict_still_accepts_hole(self):
+        # Without strict mode the behavior is unchanged: a hole is
+        # silently concatenated.
+        stream = io.BytesIO()
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL, 10, stream, start=self.START, end=self.END
+        )
+        _fix_up_virtual(download)
+        response = self._mock_response(10, 14, self.TOTAL_BYTES, self.DATA[:5])
+        await download._process_response(response)
+        response = self._mock_response(17, 19, self.TOTAL_BYTES, self.DATA[7:])
+        await download._process_response(response)
+        assert download.finished
+        assert download.bytes_downloaded == 8
+        assert stream.getvalue() == self.DATA[:5] + self.DATA[7:]
+
 
 class Test__add_bytes_range(object):
     def test_do_nothing(self):

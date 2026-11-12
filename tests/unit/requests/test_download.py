@@ -1121,6 +1121,127 @@ class TestChunkedDownload(object):
         )
 
 
+class TestChunkedDownloadStrict(object):
+    """Strict concatenation mode, downloading bytes 10-19 of a resource."""
+
+    START = 10
+    END = 19
+    TOTAL_BYTES = 30
+    DATA = b"0123456789"
+
+    @staticmethod
+    def _response_content_range(start_byte, end_byte, total_bytes):
+        return "bytes {:d}-{:d}/{:d}".format(start_byte, end_byte, total_bytes)
+
+    def _mock_response(self, start_byte, end_byte, total_bytes, content):
+        headers = {
+            "content-length": "{:d}".format(len(content)),
+            "content-range": self._response_content_range(
+                start_byte, end_byte, total_bytes
+            ),
+        }
+        return mock.Mock(
+            content=content,
+            headers=headers,
+            status_code=int(http.client.PARTIAL_CONTENT),
+            spec=["content", "headers", "status_code"],
+        )
+
+    def _scripted_transport(self, responses, requests_log):
+        def _request(method, url, **kwargs):
+            # Snapshot the headers: the download mutates them in place
+            # between requests.
+            requests_log.append(dict(kwargs["headers"]))
+            return responses[len(requests_log) - 1]
+
+        transport = mock.Mock(spec=["request"])
+        transport.request = mock.Mock(side_effect=_request)
+        return transport
+
+    def _make_download(self, chunk_size):
+        stream = io.BytesIO()
+        download = download_mod.ChunkedDownload(
+            EXAMPLE_URL,
+            chunk_size,
+            stream,
+            start=self.START,
+            end=self.END,
+            strict=True,
+        )
+        return download, stream
+
+    def test_short_chunk_then_resume(self):
+        responses = [
+            self._mock_response(10, 14, self.TOTAL_BYTES, self.DATA[:5]),
+            self._mock_response(15, 19, self.TOTAL_BYTES, self.DATA[5:]),
+        ]
+        requests_log = []
+        transport = self._scripted_transport(responses, requests_log)
+        download, stream = self._make_download(chunk_size=10)
+
+        download.consume_next_chunk(transport)
+        assert not download.finished
+        download.consume_next_chunk(transport)
+
+        # The follow-up request resumed from the actual end of the data.
+        assert requests_log == [
+            {"range": "bytes=10-19"},
+            {"range": "bytes=15-19"},
+        ]
+        assert download.finished
+        assert len(stream.getvalue()) == 10
+        assert stream.getvalue() == self.DATA
+
+    def test_middle_hole(self):
+        responses = [
+            self._mock_response(10, 14, self.TOTAL_BYTES, self.DATA[:5]),
+            self._mock_response(17, 19, self.TOTAL_BYTES, self.DATA[7:]),
+        ]
+        requests_log = []
+        transport = self._scripted_transport(responses, requests_log)
+        download, stream = self._make_download(chunk_size=10)
+
+        download.consume_next_chunk(transport)
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download.consume_next_chunk(transport)
+
+        error = exc_info.value
+        assert error.args[2] == 15
+        assert error.args[4] == 17
+        assert "received resource bytes 10-14" in error.args[0]
+        assert requests_log == [
+            {"range": "bytes=10-19"},
+            {"range": "bytes=15-19"},
+        ]
+        # Only the contiguous prefix was persisted.
+        assert len(stream.getvalue()) == 5
+        assert stream.getvalue() == self.DATA[:5]
+
+    def test_read_to_object_end(self):
+        total_bytes = 20  # The requested range ends at the object end.
+        responses = [
+            self._mock_response(10, 13, total_bytes, self.DATA[0:4]),
+            self._mock_response(14, 17, total_bytes, self.DATA[4:8]),
+            self._mock_response(18, 19, total_bytes, self.DATA[8:10]),
+        ]
+        requests_log = []
+        transport = self._scripted_transport(responses, requests_log)
+        download, stream = self._make_download(chunk_size=4)
+
+        download.consume_next_chunk(transport)
+        download.consume_next_chunk(transport)
+        download.consume_next_chunk(transport)
+
+        assert requests_log == [
+            {"range": "bytes=10-13"},
+            {"range": "bytes=14-17"},
+            {"range": "bytes=18-19"},
+        ]
+        assert download.finished
+        assert len(stream.getvalue()) == 10
+        assert stream.getvalue() == self.DATA
+
+
 class TestRawChunkedDownload(object):
     @staticmethod
     def _response_content_range(start_byte, end_byte, total_bytes):

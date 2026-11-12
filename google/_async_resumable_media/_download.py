@@ -28,6 +28,34 @@ _CONTENT_RANGE_RE = re.compile(
 _ACCEPTABLE_STATUS_CODES = (http.client.OK, http.client.PARTIAL_CONTENT)
 _GET = "GET"
 _ZERO_CONTENT_RANGE_HEADER = "bytes */0"
+_STRICT_NON_CONTIGUOUS = """\
+Non-contiguous response while downloading in strict concatenation mode:
+
+  {}
+
+The next byte expected by this download is:
+
+  {}
+
+but the response started at byte:
+
+  {}
+
+The download has already received {} bytes ({})."""
+_STRICT_TOTAL_BYTES_MISMATCH = """\
+Total byte count changed while downloading in strict concatenation mode:
+
+  {}
+
+The total byte count reported by previous responses was:
+
+  {}
+
+but this response reported:
+
+  {}
+
+The download has already received {} bytes ({})."""
 
 
 class DownloadBase(object):
@@ -222,6 +250,19 @@ class ChunkedDownload(DownloadBase):
         headers (Optional[Mapping[str, str]]): Extra headers that should
             be sent with each request, e.g. headers for data encryption
             key headers.
+        strict (Optional[bool]): If :data:`True`, enable strict
+            concatenation mode. In this mode every response is checked
+            against the download state: the response must begin exactly
+            where the previously received bytes end (no duplicate prefix
+            and no skipped bytes), the response body must match the
+            length declared by the ``content-range`` header, and the
+            total byte count must not change between responses. A
+            response that violates any of these checks raises
+            :exc:`~google.resumable_media.common.InvalidResponse` instead
+            of being silently concatenated. A short (but contiguous)
+            response is still accepted and the next request resumes from
+            the actual end of the received bytes. Defaults to
+            :data:`False`.
 
     Attributes:
         media_url (str): The URL containing the media to be downloaded.
@@ -233,7 +274,16 @@ class ChunkedDownload(DownloadBase):
         ValueError: If ``start`` is negative.
     """
 
-    def __init__(self, media_url, chunk_size, stream, start=0, end=None, headers=None):
+    def __init__(
+        self,
+        media_url,
+        chunk_size,
+        stream,
+        start=0,
+        end=None,
+        headers=None,
+        strict=False,
+    ):
         if start < 0:
             raise ValueError(
                 "On a chunked download the starting " "value cannot be negative."
@@ -245,6 +295,7 @@ class ChunkedDownload(DownloadBase):
         self._bytes_downloaded = 0
         self._total_bytes = None
         self._invalid = False
+        self._strict = strict
 
     @property
     def bytes_downloaded(self):
@@ -263,6 +314,11 @@ class ChunkedDownload(DownloadBase):
         This will occur if a call to :meth:`consume_next_chunk` fails.
         """
         return self._invalid
+
+    @property
+    def strict(self):
+        """bool: Indicates if strict concatenation mode is enabled."""
+        return self._strict
 
     def _get_byte_range(self):
         """Determines the byte range for the next request.
@@ -326,6 +382,78 @@ class ChunkedDownload(DownloadBase):
         """
         self._invalid = True
 
+    def _received_description(self):
+        """Describe the bytes received so far, for error messages.
+
+        Returns:
+            str: A human readable description of the contiguous span of
+            resource bytes already received by this download. The
+            description can be used to locate where the next response
+            must resume from.
+        """
+        if self._bytes_downloaded == 0:
+            return "no bytes received yet"
+        return "received resource bytes {:d}-{:d}".format(
+            self.start, self.start + self._bytes_downloaded - 1
+        )
+
+    def _check_strict_range(self, response, start_byte, end_byte, total_bytes):
+        """Validate a response range against the current download state.
+
+        This is only invoked when strict concatenation mode is enabled.
+        It makes sure the response starts exactly where the previously
+        received bytes end, so that a duplicate prefix or a skipped
+        segment cannot be silently concatenated, and that the total byte
+        count does not change between responses.
+
+        Args:
+            response (object): An HTTP response object.
+            start_byte (int): The first byte of the response, as reported
+                by the ``content-range`` header.
+            end_byte (int): The last byte of the response, as reported by
+                the ``content-range`` header.
+            total_bytes (int): The total byte count of the resource, as
+                reported by the ``content-range`` header.
+
+        Raises:
+            ~google.resumable_media.common.InvalidResponse: If the
+                response range is not contiguous with the bytes already
+                received, or if the total byte count changed.
+        """
+        expected_start = self.start + self._bytes_downloaded
+        if start_byte != expected_start:
+            self._make_invalid()
+            raise common.InvalidResponse(
+                response,
+                _STRICT_NON_CONTIGUOUS.format(
+                    self.media_url,
+                    expected_start,
+                    start_byte,
+                    self._bytes_downloaded,
+                    self._received_description(),
+                ),
+                "Expected start byte",
+                expected_start,
+                "Received start byte",
+                start_byte,
+            )
+        if self.total_bytes is not None and total_bytes != self.total_bytes:
+            self._make_invalid()
+            raise common.InvalidResponse(
+                response,
+                _STRICT_TOTAL_BYTES_MISMATCH.format(
+                    self.media_url,
+                    self.total_bytes,
+                    total_bytes,
+                    self._bytes_downloaded,
+                    self._received_description(),
+                ),
+                "Expected total bytes",
+                self.total_bytes,
+                "Received total bytes",
+                total_bytes,
+            )
+
     async def _process_response(self, response):
         """Process the response from an HTTP request.
 
@@ -342,7 +470,8 @@ class ChunkedDownload(DownloadBase):
 
         If ``total_bytes`` is already set, this assumes (but does not check)
         that we already have the correct value and doesn't bother to check
-        that it agrees with the headers.
+        that it agrees with the headers, unless strict concatenation mode
+        is enabled.
 
         We expect the **total** length to be in the ``content-range`` header,
         but this header is only present on requests which sent the ``range``
@@ -350,12 +479,23 @@ class ChunkedDownload(DownloadBase):
         ``bytes {start}-{end}/{total}`` and ``{end} - {start} + 1``
         should be the same as the ``Content-Length``.
 
+        When strict concatenation mode is enabled, the response is also
+        checked to start at ``start + bytes_downloaded`` and the total
+        byte count is checked against any value already observed. A
+        contiguous short response is accepted and the next request
+        resumes from the actual end of the received bytes; any other
+        response fails before it is written to the stream.
+
         Args:
             response (object): The HTTP response object (need headers).
 
         Raises:
             ~google.resumable_media.common.InvalidResponse: If the number
-                of bytes in the body doesn't match the content length header.
+                of bytes in the body doesn't match the content length
+                header or, in strict concatenation mode, if the response
+                range is not contiguous with the received bytes, if the
+                total byte count changes, or if the body length does not
+                match the content range.
 
         .. _sans-I/O: https://sans-io.readthedocs.io/
         """
@@ -378,6 +518,9 @@ class ChunkedDownload(DownloadBase):
         start_byte, end_byte, total_bytes = get_range_info(
             response, self._get_headers, callback=self._make_invalid
         )
+
+        if self._strict:
+            self._check_strict_range(response, start_byte, end_byte, total_bytes)
 
         transfer_encoding = headers.get("transfer-encoding")
 
@@ -403,6 +546,17 @@ class ChunkedDownload(DownloadBase):
         else:
             # 'content-length' header not allowed with chunked encoding.
             num_bytes = end_byte - start_byte + 1
+
+        if self._strict and len(response_body) != end_byte - start_byte + 1:
+            self._make_invalid()
+            raise common.InvalidResponse(
+                response,
+                "Response body is different size than content-range",
+                "Expected",
+                end_byte - start_byte + 1,
+                "Received",
+                len(response_body),
+            )
 
         # First update ``bytes_downloaded``.
         self._bytes_downloaded += num_bytes

@@ -297,6 +297,13 @@ class ChunkedDownload(_request_helpers.RequestsMixin, _download.ChunkedDownload)
         headers (Optional[Mapping[str, str]]): Extra headers that should
             be sent with each request, e.g. headers for data encryption
             key headers.
+        strict (Optional[bool]): If :data:`True`, enable strict
+            concatenation mode, which rejects responses that return a
+            duplicate prefix, skip bytes, change the total byte count, or
+            deliver a body whose length does not match the content
+            range. Contiguous short responses are accepted and the next
+            request resumes from the actual end of the received bytes.
+            Defaults to :data:`False`.
 
     Attributes:
         media_url (str): The URL containing the media to be downloaded.
@@ -363,6 +370,13 @@ class RawChunkedDownload(_request_helpers.RawRequestsMixin, _download.ChunkedDow
         headers (Optional[Mapping[str, str]]): Extra headers that should
             be sent with each request, e.g. headers for data encryption
             key headers.
+        strict (Optional[bool]): If :data:`True`, enable strict
+            concatenation mode, which rejects responses that return a
+            duplicate prefix, skip bytes, change the total byte count, or
+            deliver a body whose length does not match the content
+            range. Contiguous short responses are accepted and the next
+            request resumes from the actual end of the received bytes.
+            Defaults to :data:`False`.
 
     Attributes:
         media_url (str): The URL containing the media to be downloaded.
