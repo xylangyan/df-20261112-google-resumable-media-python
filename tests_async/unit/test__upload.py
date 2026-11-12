@@ -298,6 +298,53 @@ class TestMultipartUpload(object):
 
         exc_info.match("virtual")
 
+    def test_fingerprint_independent_of_key_order_and_boundary(self):
+        upload = _upload.MultipartUpload(sync_test.MULTIPART_URL)
+        data = b"Hi"
+        content_type = sync_test.BASIC_CONTENT
+        metadata = {"name": "file.txt", "acl": [{"entity": "user-a", "role": "R"}]}
+        reordered = {"acl": [{"role": "R", "entity": "user-a"}], "name": "file.txt"}
+
+        first = upload.fingerprint(data, metadata, content_type)
+        rebuilt = _upload.MultipartUpload(sync_test.MULTIPART_URL).fingerprint(
+            data, reordered, content_type
+        )
+
+        assert first == rebuilt
+        assert isinstance(first, str)
+        assert len(first) == 64
+
+    def test_fingerprint_changes_with_array_order(self):
+        upload = _upload.MultipartUpload(sync_test.MULTIPART_URL)
+        data = b"Hi"
+        content_type = sync_test.BASIC_CONTENT
+        metadata = {"acl": [{"entity": "user-a"}, {"entity": "user-b"}]}
+        swapped = {"acl": [{"entity": "user-b"}, {"entity": "user-a"}]}
+
+        assert upload.fingerprint(
+            data, metadata, content_type
+        ) != _upload.MultipartUpload(sync_test.MULTIPART_URL).fingerprint(
+            data, swapped, content_type
+        )
+
+    def test_fingerprint_changes_with_bytes_and_content_type(self):
+        data = b"Hi"
+        metadata = {"name": "file.txt"}
+        upload = _upload.MultipartUpload(sync_test.MULTIPART_URL)
+        baseline = upload.fingerprint(data, metadata, sync_test.BASIC_CONTENT)
+
+        assert baseline != _upload.MultipartUpload(sync_test.MULTIPART_URL).fingerprint(
+            b"Ho", metadata, sync_test.BASIC_CONTENT
+        )
+        assert baseline != _upload.MultipartUpload(sync_test.MULTIPART_URL).fingerprint(
+            data, metadata, "image/jpeg"
+        )
+
+    def test_fingerprint_unserializable_metadata(self):
+        upload = _upload.MultipartUpload(sync_test.MULTIPART_URL)
+        with pytest.raises(TypeError):
+            upload.fingerprint(b"Hi", {"bad": object()}, sync_test.BASIC_CONTENT)
+
 
 class TestResumableUpload(object):
     def test_constructor(self):

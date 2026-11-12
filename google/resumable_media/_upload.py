@@ -21,6 +21,7 @@ Supported here are:
 * resumable uploads (with metadata as well)
 """
 
+import hashlib
 import http.client
 import json
 import os
@@ -338,6 +339,34 @@ class MultipartUpload(UploadBase):
             NotImplementedError: Always, since virtual.
         """
         raise NotImplementedError("This implementation is virtual.")
+
+    def fingerprint(self, data, metadata, content_type):
+        """Compute a fingerprint of the content to be uploaded.
+
+        This is an optional helper that callers may use to record a stable
+        identifier of the upload **before** transmitting it. The fingerprint
+        depends only on the resource metadata, the resource bytes and the
+        content type: it is independent of the random multipart boundary
+        generated when the request is prepared. The metadata is serialized
+        canonically, so two mappings that differ only in key insertion order
+        produce the same fingerprint, while the order of array (list)
+        elements, the resource bytes and the content type are all
+        significant.
+
+        Args:
+            data (bytes): The resource content to be uploaded.
+            metadata (Mapping[str, str]): The resource metadata, such as an
+                ACL list.
+            content_type (str): The content type of the resource, e.g. a JPEG
+                image has content type ``image/jpeg``.
+
+        Returns:
+            str: The hex digest identifying the upload content.
+
+        Raises:
+            TypeError: If ``metadata`` cannot be serialized to JSON.
+        """
+        return construct_multipart_fingerprint(data, metadata, content_type)
 
 
 class ResumableUpload(UploadBase):
@@ -1426,6 +1455,58 @@ def construct_multipart_request(data, metadata, content_type):
     )
 
     return content, multipart_boundary
+
+
+def construct_multipart_fingerprint(data, metadata, content_type):
+    """Compute a stable fingerprint of a multipart upload's content.
+
+    The fingerprint identifies the upload by its metadata, resource bytes
+    and content type only. It deliberately excludes the random multipart
+    boundary used by :func:`construct_multipart_request`, so rebuilding the
+    same upload produces the same fingerprint even though the request body
+    differs.
+
+    The metadata is serialized canonically (object keys sorted, list order
+    preserved), so two mappings with the same content but different key
+    insertion order yield the same fingerprint. Reordering array elements,
+    changing the resource bytes or changing the content type all yield a
+    different fingerprint.
+
+    Args:
+        data (bytes): The resource content to be uploaded.
+        metadata (Mapping[str, str]): The resource metadata, such as an
+            ACL list.
+        content_type (str): The content type of the resource, e.g. a JPEG
+            image has content type ``image/jpeg``.
+
+    Returns:
+        str: The hex-encoded SHA-256 digest of the upload content.
+
+    Raises:
+        TypeError: If ``data`` is not bytes, or if ``metadata`` cannot be
+            serialized to JSON.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("`data` must be bytes, received", type(data))
+
+    try:
+        metadata_bytes = json.dumps(
+            metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "`metadata` must be JSON-serializable to compute a fingerprint."
+        ) from exc
+
+    content_type_bytes = content_type.encode("utf-8")
+
+    digest = hashlib.sha256()
+    # Length-prefix each field so the concatenation is unambiguous.
+    for chunk in (metadata_bytes, content_type_bytes, data):
+        digest.update(str(len(chunk)).encode("ascii"))
+        digest.update(b":")
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def get_total_bytes(stream):

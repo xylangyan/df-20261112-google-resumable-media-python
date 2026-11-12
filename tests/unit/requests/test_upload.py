@@ -167,6 +167,84 @@ class TestMultipartUpload(object):
         assert upload.finished
         mock_get_boundary.assert_called_once_with()
 
+    @mock.patch(
+        "google.resumable_media._upload.get_boundary",
+        side_effect=[b"==first==", b"==second=="],
+    )
+    def test_transmit_fingerprint_stable_across_boundaries(self, _mock_get_boundary):
+        data = b"Mock data here and there."
+        metadata = {
+            "name": "file.txt",
+            "acl": [
+                {"entity": "user-a", "role": "READER"},
+                {"entity": "user-b", "role": "WRITER"},
+            ],
+        }
+        # The same content with object keys inserted in a different order.
+        reordered_metadata = {
+            "acl": [
+                {"role": "READER", "entity": "user-a"},
+                {"role": "WRITER", "entity": "user-b"},
+            ],
+            "name": "file.txt",
+        }
+        content_type = BASIC_CONTENT
+
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _make_response()
+
+        first_upload = upload_mod.MultipartUpload(MULTIPART_URL)
+        first_fingerprint = first_upload.fingerprint(data, metadata, content_type)
+        first_upload.transmit(transport, data, metadata, content_type)
+
+        second_upload = upload_mod.MultipartUpload(MULTIPART_URL)
+        second_fingerprint = second_upload.fingerprint(
+            data, reordered_metadata, content_type
+        )
+        second_upload.transmit(
+            transport, data, reordered_metadata, content_type
+        )
+
+        assert transport.request.call_count == 2
+        first_call = transport.request.call_args_list[0]
+        second_call = transport.request.call_args_list[1]
+        # Each request keeps its own random boundary and therefore its own body.
+        assert b"==first==" in first_call.kwargs["data"]
+        assert b"==second==" in second_call.kwargs["data"]
+        assert first_call.kwargs["data"] != second_call.kwargs["data"]
+        assert (
+            first_call.kwargs["headers"]["content-type"]
+            == b'multipart/related; boundary="==first=="'
+        )
+        assert (
+            second_call.kwargs["headers"]["content-type"]
+            == b'multipart/related; boundary="==second=="'
+        )
+        # The fingerprints agree despite the differing boundaries / key order.
+        assert first_fingerprint == second_fingerprint
+
+    def test_transmit_fingerprint_distinguishes_array_order(self):
+        data = b"Mock data here and there."
+        metadata = {"acl": [{"entity": "user-a"}, {"entity": "user-b"}]}
+        swapped = {"acl": [{"entity": "user-b"}, {"entity": "user-a"}]}
+        content_type = BASIC_CONTENT
+
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _make_response()
+
+        first_upload = upload_mod.MultipartUpload(MULTIPART_URL)
+        first_fingerprint = first_upload.fingerprint(data, metadata, content_type)
+        first_upload.transmit(transport, data, metadata, content_type)
+
+        second_upload = upload_mod.MultipartUpload(MULTIPART_URL)
+        second_fingerprint = second_upload.fingerprint(
+            data, swapped, content_type
+        )
+        second_upload.transmit(transport, data, swapped, content_type)
+
+        # Only the array position changed, so only the fingerprint must differ.
+        assert first_fingerprint != second_fingerprint
+
 
 class TestResumableUpload(object):
     def test_initiate(self):

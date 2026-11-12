@@ -316,6 +316,36 @@ class MultipartUpload(UploadBase):
         """
         raise NotImplementedError("This implementation is virtual.")
 
+    def fingerprint(self, data, metadata, content_type):
+        """Compute a fingerprint of the content to be uploaded.
+
+        This is an optional helper that callers may use to record a stable
+        identifier of the upload **before** transmitting it. The fingerprint
+        depends only on the resource metadata, the resource bytes and the
+        content type: it is independent of the random multipart boundary
+        generated when the request is prepared. The metadata is serialized
+        canonically, so two mappings that differ only in key insertion order
+        produce the same fingerprint, while the order of array (list)
+        elements, the resource bytes and the content type are all
+        significant.
+
+        Args:
+            data (bytes): The resource content to be uploaded.
+            metadata (Mapping[str, str]): The resource metadata, such as an
+                ACL list.
+            content_type (str): The content type of the resource, e.g. a JPEG
+                image has content type ``image/jpeg``.
+
+        Returns:
+            str: The hex digest identifying the upload content.
+
+        Raises:
+            TypeError: If ``metadata`` cannot be serialized to JSON.
+        """
+        return sync_upload.construct_multipart_fingerprint(
+            data, metadata, content_type
+        )
+
 
 class ResumableUpload(UploadBase, sync_upload.ResumableUpload):
     """Initiate and fulfill a resumable upload to a Google API.
