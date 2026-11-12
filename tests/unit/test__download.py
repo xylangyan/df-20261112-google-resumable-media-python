@@ -593,6 +593,120 @@ class TestChunkedDownload(object):
         assert download.bytes_downloaded == 0
         assert download.total_bytes is None
 
+    def test__process_response_short_writes(self):
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        total_bytes = 24
+        stream = _ShortWriteSink([3, 2])
+        download = _download.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        _fix_up_virtual(download)
+
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        download._process_response(response)
+        # The chunk is written in three short writes (3, 2, remainder) and
+        # the download only advances once the whole chunk is accepted.
+        assert stream.calls == [(8, 3), (5, 2), (3, 3)]
+        assert stream.getvalue() == data
+        assert not download.finished
+        assert not download.invalid
+        assert download.bytes_downloaded == chunk_size
+        assert download.total_bytes == total_bytes
+        # The next request picks up right after the confirmed bytes.
+        _, _, _, headers = download._prepare_request()
+        assert headers == {"range": "bytes=8-15"}
+
+    def test__process_response_stream_stops_with_position(self):
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        total_bytes = 24
+        stream = _StoppingSink(3)
+        download = _download.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        _fix_up_virtual(download)
+
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download._process_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert isinstance(error.__cause__, OSError)
+        # The confirmed position is 3 bytes, so the download is advanced by
+        # 3 bytes and marked invalid; a new download can resume from there.
+        assert stream.getvalue() == data[:3]
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 3
+        assert download.total_bytes is None
+        with pytest.raises(ValueError) as exc_info:
+            download._prepare_request()
+        assert exc_info.match("Download is invalid and cannot be re-used.")
+
+    def test__process_response_stream_stops_without_position(self):
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        total_bytes = 24
+        stream = _StoppingSink(3, can_tell=False)
+        download = _download.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        _fix_up_virtual(download)
+
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download._process_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert isinstance(error.__cause__, OSError)
+        # The position cannot be determined, so no bytes are confirmed and
+        # the download is left in an explicit non-resumable state.
+        assert stream.getvalue() == data[:3]
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert download.total_bytes is None
+
+    def test__process_response_stream_returns_zero(self):
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        total_bytes = 24
+        stream = _ZeroWriteSink()
+        download = _download.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        _fix_up_virtual(download)
+
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download._process_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert download.total_bytes is None
+
     def test_consume_next_chunk(self):
         download = _download.ChunkedDownload(EXAMPLE_URL, 256, None)
         with pytest.raises(NotImplementedError) as exc_info:
@@ -744,6 +858,66 @@ def _fix_up_virtual(download):
     download._get_status_code = _get_status_code
     download._get_headers = _get_headers
     download._get_body = _get_body
+
+
+class _ShortWriteSink(object):
+    """A write-able sink that short-writes until its limits are exhausted.
+
+    The first writes accept at most the number of bytes in ``limits``; any
+    later write accepts the entire payload.
+    """
+
+    def __init__(self, limits):
+        self._limits = list(limits)
+        self._buffer = io.BytesIO()
+        self.calls = []
+
+    def write(self, data):
+        if self._limits:
+            num_bytes = min(self._limits.pop(0), len(data))
+        else:
+            num_bytes = len(data)
+        self._buffer.write(data[:num_bytes])
+        self.calls.append((len(data), num_bytes))
+        return num_bytes
+
+    def tell(self):
+        return self._buffer.tell()
+
+    def getvalue(self):
+        return self._buffer.getvalue()
+
+
+class _StoppingSink(object):
+    """A write-able sink that always short-writes then raises an error."""
+
+    def __init__(self, limit, can_tell=True):
+        self._limit = limit
+        self._can_tell = can_tell
+        self._buffer = io.BytesIO()
+
+    def write(self, data):
+        num_bytes = min(self._limit, len(data))
+        self._buffer.write(data[:num_bytes])
+        raise OSError("simulated write failure")
+
+    def tell(self):
+        if not self._can_tell:
+            raise OSError("position not available")
+        return self._buffer.tell()
+
+    def getvalue(self):
+        return self._buffer.getvalue()
+
+
+class _ZeroWriteSink(object):
+    """A write-able sink that always reports that zero bytes were written."""
+
+    def write(self, data):
+        return 0
+
+    def tell(self):
+        return 0
 
 
 def _check_retry_strategy(download):

@@ -28,6 +28,20 @@ _CONTENT_RANGE_RE = re.compile(
 _ACCEPTABLE_STATUS_CODES = (http.client.OK, http.client.PARTIAL_CONTENT)
 _GET = "GET"
 _ZERO_CONTENT_RANGE_HEADER = "bytes */0"
+_ZERO_WRITE_MESSAGE = """\
+The stream returned 0 bytes written, so the download cannot make progress.
+Bytes confirmed written: {:d} of {:d} in the current chunk.
+The download is invalid and cannot be resumed from this stream.
+"""
+_STREAM_WRITE_ERROR_MESSAGE = """\
+The stream raised an error while writing the downloaded chunk.
+Bytes confirmed written: {:d} of {:d} in the current chunk.
+The download is invalid; restart it from byte offset {:d} of the media.
+"""
+_STREAM_POSITION_UNKNOWN_MESSAGE = """\
+The stream raised an error while writing the downloaded chunk and its
+position could not be determined, so the download cannot be resumed.
+"""
 
 
 class DownloadBase(object):
@@ -326,6 +340,86 @@ class ChunkedDownload(DownloadBase):
         """
         self._invalid = True
 
+    def _get_stream_position(self):
+        """Get the confirmed position of the stream, if possible.
+
+        Returns:
+            Optional[int]: The current position of the stream, or
+            :data:`None` if it cannot be determined.
+        """
+        tell = getattr(self._stream, "tell", None)
+        if tell is None:
+            return None
+        try:
+            position = tell()
+        except Exception:
+            return None
+        if not isinstance(position, int) or position < 0:
+            return None
+        return position
+
+    def _write_to_stream(self, response, data):
+        """Write the response body to the stream, handling short writes.
+
+        Keeps writing the remaining bytes until the whole chunk has been
+        accepted by the stream. The download is only advanced by the number
+        of bytes actually confirmed as written.
+
+        Args:
+            response (object): The HTTP response object.
+            data (bytes): The response body to write.
+
+        Returns:
+            int: The number of bytes confirmed as written to the stream.
+
+        Raises:
+            ~google.resumable_media.common.InvalidResponse: If the stream
+                cannot accept the whole chunk. If the confirmed position
+                can be determined, ``bytes_downloaded`` is updated so the
+                download can be restarted from that offset; otherwise the
+                download is left in an explicit non-resumable state.
+        """
+        total_bytes = len(data)
+        written = 0
+        while written < total_bytes:
+            remaining = data[written:]
+            try:
+                result = self._stream.write(remaining)
+            except Exception as exc:
+                position = self._get_stream_position()
+                if position is None:
+                    self._make_invalid()
+                    raise common.InvalidResponse(
+                        response, _STREAM_POSITION_UNKNOWN_MESSAGE
+                    ) from exc
+                confirmed = min(max(position, 0), total_bytes)
+                self._bytes_downloaded += confirmed
+                self._make_invalid()
+                raise common.InvalidResponse(
+                    response,
+                    _STREAM_WRITE_ERROR_MESSAGE.format(
+                        confirmed, total_bytes, self.start + self._bytes_downloaded
+                    ),
+                ) from exc
+            if result is None:
+                # Some file-like objects return ``None`` from ``write()``;
+                # treat that as a full write of the remaining bytes.
+                result = len(remaining)
+            if not isinstance(result, int) or result < 0 or result > len(remaining):
+                self._make_invalid()
+                raise common.InvalidResponse(
+                    response,
+                    _STREAM_POSITION_UNKNOWN_MESSAGE,
+                )
+            if result == 0:
+                self._make_invalid()
+                raise common.InvalidResponse(
+                    response,
+                    _ZERO_WRITE_MESSAGE.format(written, total_bytes),
+                )
+            written += result
+        return written
+
     async def _process_response(self, response):
         """Process the response from an HTTP request.
 
@@ -337,8 +431,8 @@ class ChunkedDownload(DownloadBase):
         network I/O.
 
         Updates the current state after consuming a chunk. First,
-        increments ``bytes_downloaded`` by the number of bytes in the
-        ``content-length`` header.
+        increments ``bytes_downloaded`` by the number of bytes actually
+        written to the stream for the current chunk.
 
         If ``total_bytes`` is already set, this assumes (but does not check)
         that we already have the correct value and doesn't bother to check
@@ -356,6 +450,9 @@ class ChunkedDownload(DownloadBase):
         Raises:
             ~google.resumable_media.common.InvalidResponse: If the number
                 of bytes in the body doesn't match the content length header.
+            ~google.resumable_media.common.InvalidResponse: If the stream
+                cannot accept the whole chunk (e.g. it short-writes and then
+                stops, returns 0 bytes written, or raises an error).
 
         .. _sans-I/O: https://sans-io.readthedocs.io/
         """
@@ -400,12 +497,16 @@ class ChunkedDownload(DownloadBase):
                     "Received",
                     len(response_body),
                 )
-        else:
-            # 'content-length' header not allowed with chunked encoding.
-            num_bytes = end_byte - start_byte + 1
+        # NOTE: 'content-length' header not allowed with chunked encoding.
 
-        # First update ``bytes_downloaded``.
-        self._bytes_downloaded += num_bytes
+        # Write the response body to the stream first. This may raise if the
+        # stream cannot accept the whole chunk, in which case the download
+        # is marked invalid and only the confirmed bytes are counted.
+        bytes_written = self._write_to_stream(response, response_body)
+
+        # Update ``bytes_downloaded`` by the number of bytes actually
+        # confirmed as written to the stream.
+        self._bytes_downloaded += bytes_written
         # If the end byte is past ``end`` or ``total_bytes - 1`` we are done.
         if self.end is not None and end_byte >= self.end:
             self._finished = True
@@ -414,8 +515,6 @@ class ChunkedDownload(DownloadBase):
         # NOTE: We only use ``total_bytes`` if not already known.
         if self.total_bytes is None:
             self._total_bytes = total_bytes
-        # Write the response body to the stream.
-        self._stream.write(response_body)
 
     def consume_next_chunk(self, transport, timeout=None):
         """Consume the next chunk of the resource to be downloaded.

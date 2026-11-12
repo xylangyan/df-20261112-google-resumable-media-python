@@ -610,6 +610,127 @@ class TestChunkedDownload(object):
             timeout=14.7,
         )
 
+    @pytest.mark.asyncio
+    async def test_consume_next_chunk_short_writes(self):
+        stream = sync_test._ShortWriteSink([3, 2])
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        download = download_mod.ChunkedDownload(
+            sync_test.EXAMPLE_URL, chunk_size, stream
+        )
+        total_bytes = 24
+        transport = self._mock_transport(0, chunk_size, total_bytes, content=data)
+
+        # The network returns the full 8 bytes but the sink accepts them in
+        # three short writes (3, 2, remainder); the chunk is only consumed
+        # once the whole response body has been written.
+        ret_val = await download.consume_next_chunk(transport)
+        assert ret_val is transport.request.return_value
+        assert stream.calls == [(8, 3), (5, 2), (3, 3)]
+        assert stream.getvalue() == data
+        assert not download.finished
+        assert not download.invalid
+        assert download.bytes_downloaded == chunk_size
+        assert download.total_bytes == total_bytes
+        # The next request picks up right after the confirmed bytes.
+        method, url, payload, headers = download._prepare_request()
+        assert method == "GET"
+        assert url == sync_test.EXAMPLE_URL
+        assert payload is None
+        assert headers == {"range": "bytes=8-15"}
+
+    @pytest.mark.asyncio
+    async def test_consume_next_chunk_stream_stops_with_position(self):
+        stream = sync_test._StoppingSink(3)
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        download = download_mod.ChunkedDownload(
+            sync_test.EXAMPLE_URL, chunk_size, stream
+        )
+        total_bytes = 24
+        transport = self._mock_transport(0, chunk_size, total_bytes, content=data)
+
+        # The sink stops mid-write; the caller gets an InvalidResponse and
+        # the download is advanced only by the confirmed bytes.
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download.consume_next_chunk(transport)
+
+        error = exc_info.value
+        assert error.response is transport.request.return_value
+        assert isinstance(error.__cause__, OSError)
+        assert stream.getvalue() == data[:3]
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 3
+        assert download.total_bytes is None
+        # The download cannot be re-used, but a fresh download can resume
+        # from the confirmed offset.
+        with pytest.raises(ValueError) as exc_info:
+            download._prepare_request()
+        assert exc_info.match("Download is invalid and cannot be re-used.")
+        resumed = download_mod.ChunkedDownload(
+            sync_test.EXAMPLE_URL,
+            chunk_size,
+            stream,
+            start=download.bytes_downloaded,
+        )
+        _, _, _, headers = resumed._prepare_request()
+        assert headers == {"range": "bytes=3-10"}
+
+    @pytest.mark.asyncio
+    async def test_consume_next_chunk_stream_stops_without_position(self):
+        stream = sync_test._StoppingSink(3, can_tell=False)
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        download = download_mod.ChunkedDownload(
+            sync_test.EXAMPLE_URL, chunk_size, stream
+        )
+        total_bytes = 24
+        transport = self._mock_transport(0, chunk_size, total_bytes, content=data)
+
+        # The sink stops mid-write and its position cannot be determined;
+        # the caller gets an explicit non-resumable error.
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download.consume_next_chunk(transport)
+
+        error = exc_info.value
+        assert error.response is transport.request.return_value
+        assert isinstance(error.__cause__, OSError)
+        assert stream.getvalue() == data[:3]
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert download.total_bytes is None
+        with pytest.raises(ValueError) as exc_info:
+            download._prepare_request()
+        assert exc_info.match("Download is invalid and cannot be re-used.")
+
+    @pytest.mark.asyncio
+    async def test_consume_next_chunk_stream_returns_zero(self):
+        stream = sync_test._ZeroWriteSink()
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        download = download_mod.ChunkedDownload(
+            sync_test.EXAMPLE_URL, chunk_size, stream
+        )
+        total_bytes = 24
+        transport = self._mock_transport(0, chunk_size, total_bytes, content=data)
+
+        # A sink that reports zero bytes written cannot make progress; the
+        # caller gets an explicit non-resumable error.
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download.consume_next_chunk(transport)
+
+        error = exc_info.value
+        assert error.response is transport.request.return_value
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert download.total_bytes is None
+        with pytest.raises(ValueError) as exc_info:
+            download._prepare_request()
+        assert exc_info.match("Download is invalid and cannot be re-used.")
+
 
 class TestRawChunkedDownload(object):
     @staticmethod

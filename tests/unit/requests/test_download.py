@@ -1120,6 +1120,112 @@ class TestChunkedDownload(object):
             timeout=14.7,
         )
 
+    def test_consume_next_chunk_short_writes(self):
+        stream = _ShortWriteSink([3, 2])
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        download = download_mod.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        total_bytes = 24
+        transport = self._mock_transport(0, chunk_size, total_bytes, content=data)
+
+        # The network returns the full 8 bytes but the sink accepts them in
+        # three short writes (3, 2, remainder); the chunk is only consumed
+        # once the whole response body has been written.
+        ret_val = download.consume_next_chunk(transport)
+        assert ret_val is transport.request.return_value
+        assert stream.calls == [(8, 3), (5, 2), (3, 3)]
+        assert stream.getvalue() == data
+        assert not download.finished
+        assert not download.invalid
+        assert download.bytes_downloaded == chunk_size
+        assert download.total_bytes == total_bytes
+        # The next request picks up right after the confirmed bytes.
+        method, url, payload, headers = download._prepare_request()
+        assert method == "GET"
+        assert url == EXAMPLE_URL
+        assert payload is None
+        assert headers == {"range": "bytes=8-15"}
+
+    def test_consume_next_chunk_stream_stops_with_position(self):
+        stream = _StoppingSink(3)
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        download = download_mod.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        total_bytes = 24
+        transport = self._mock_transport(0, chunk_size, total_bytes, content=data)
+
+        # The sink stops mid-write; the caller gets an InvalidResponse and
+        # the download is advanced only by the confirmed bytes.
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download.consume_next_chunk(transport)
+
+        error = exc_info.value
+        assert error.response is transport.request.return_value
+        assert isinstance(error.__cause__, OSError)
+        assert stream.getvalue() == data[:3]
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 3
+        assert download.total_bytes is None
+        # The download cannot be re-used, but a fresh download can resume
+        # from the confirmed offset.
+        with pytest.raises(ValueError) as exc_info:
+            download._prepare_request()
+        assert exc_info.match("Download is invalid and cannot be re-used.")
+        resumed = download_mod.ChunkedDownload(
+            EXAMPLE_URL, chunk_size, stream, start=download.bytes_downloaded
+        )
+        _, _, _, headers = resumed._prepare_request()
+        assert headers == {"range": "bytes=3-10"}
+
+    def test_consume_next_chunk_stream_stops_without_position(self):
+        stream = _StoppingSink(3, can_tell=False)
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        download = download_mod.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        total_bytes = 24
+        transport = self._mock_transport(0, chunk_size, total_bytes, content=data)
+
+        # The sink stops mid-write and its position cannot be determined;
+        # the caller gets an explicit non-resumable error.
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download.consume_next_chunk(transport)
+
+        error = exc_info.value
+        assert error.response is transport.request.return_value
+        assert isinstance(error.__cause__, OSError)
+        assert stream.getvalue() == data[:3]
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert download.total_bytes is None
+        with pytest.raises(ValueError) as exc_info:
+            download._prepare_request()
+        assert exc_info.match("Download is invalid and cannot be re-used.")
+
+    def test_consume_next_chunk_stream_returns_zero(self):
+        stream = _ZeroWriteSink()
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        download = download_mod.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        total_bytes = 24
+        transport = self._mock_transport(0, chunk_size, total_bytes, content=data)
+
+        # A sink that reports zero bytes written cannot make progress; the
+        # caller gets an explicit non-resumable error.
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download.consume_next_chunk(transport)
+
+        error = exc_info.value
+        assert error.response is transport.request.return_value
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert download.total_bytes is None
+        with pytest.raises(ValueError) as exc_info:
+            download._prepare_request()
+        assert exc_info.match("Download is invalid and cannot be re-used.")
+
 
 class TestRawChunkedDownload(object):
     @staticmethod
@@ -1416,3 +1522,63 @@ def _mock_raw_response(status_code=http.client.OK, chunks=(), headers=None):
     response.__enter__.return_value = response
     response.__exit__.return_value = None
     return response
+
+
+class _ShortWriteSink(object):
+    """A write-able sink that short-writes until its limits are exhausted.
+
+    The first writes accept at most the number of bytes in ``limits``; any
+    later write accepts the entire payload.
+    """
+
+    def __init__(self, limits):
+        self._limits = list(limits)
+        self._buffer = io.BytesIO()
+        self.calls = []
+
+    def write(self, data):
+        if self._limits:
+            num_bytes = min(self._limits.pop(0), len(data))
+        else:
+            num_bytes = len(data)
+        self._buffer.write(data[:num_bytes])
+        self.calls.append((len(data), num_bytes))
+        return num_bytes
+
+    def tell(self):
+        return self._buffer.tell()
+
+    def getvalue(self):
+        return self._buffer.getvalue()
+
+
+class _StoppingSink(object):
+    """A write-able sink that always short-writes then raises an error."""
+
+    def __init__(self, limit, can_tell=True):
+        self._limit = limit
+        self._can_tell = can_tell
+        self._buffer = io.BytesIO()
+
+    def write(self, data):
+        num_bytes = min(self._limit, len(data))
+        self._buffer.write(data[:num_bytes])
+        raise OSError("simulated write failure")
+
+    def tell(self):
+        if not self._can_tell:
+            raise OSError("position not available")
+        return self._buffer.tell()
+
+    def getvalue(self):
+        return self._buffer.getvalue()
+
+
+class _ZeroWriteSink(object):
+    """A write-able sink that always reports that zero bytes were written."""
+
+    def write(self, data):
+        return 0
+
+    def tell(self):
+        return 0

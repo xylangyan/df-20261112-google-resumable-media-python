@@ -611,6 +611,124 @@ class TestChunkedDownload(object):
         assert download.bytes_downloaded == 0
         assert download.total_bytes is None
 
+    @pytest.mark.asyncio
+    async def test__process_response_short_writes(self):
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        total_bytes = 24
+        stream = sync_test._ShortWriteSink([3, 2])
+        download = _download.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        _fix_up_virtual(download)
+
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        await download._process_response(response)
+        # The chunk is written in three short writes (3, 2, remainder) and
+        # the download only advances once the whole chunk is accepted.
+        assert stream.calls == [(8, 3), (5, 2), (3, 3)]
+        assert stream.getvalue() == data
+        assert not download.finished
+        assert not download.invalid
+        assert download.bytes_downloaded == chunk_size
+        assert download.total_bytes == total_bytes
+        # The next request picks up right after the confirmed bytes.
+        _, _, _, headers = download._prepare_request()
+        assert headers == {"range": "bytes=8-15"}
+
+    @pytest.mark.asyncio
+    async def test__process_response_stream_stops_with_position(self):
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        total_bytes = 24
+        stream = sync_test._StoppingSink(3)
+        download = _download.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        _fix_up_virtual(download)
+
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download._process_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert isinstance(error.__cause__, OSError)
+        # The confirmed position is 3 bytes, so the download is advanced by
+        # 3 bytes and marked invalid; a new download can resume from there.
+        assert stream.getvalue() == data[:3]
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 3
+        assert download.total_bytes is None
+        with pytest.raises(ValueError) as exc_info:
+            download._prepare_request()
+        assert exc_info.match("Download is invalid and cannot be re-used.")
+
+    @pytest.mark.asyncio
+    async def test__process_response_stream_stops_without_position(self):
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        total_bytes = 24
+        stream = sync_test._StoppingSink(3, can_tell=False)
+        download = _download.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        _fix_up_virtual(download)
+
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download._process_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert isinstance(error.__cause__, OSError)
+        # The position cannot be determined, so no bytes are confirmed and
+        # the download is left in an explicit non-resumable state.
+        assert stream.getvalue() == data[:3]
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert download.total_bytes is None
+
+    @pytest.mark.asyncio
+    async def test__process_response_stream_returns_zero(self):
+        data = b"ABCDEFGH"
+        chunk_size = len(data)
+        total_bytes = 24
+        stream = sync_test._ZeroWriteSink()
+        download = _download.ChunkedDownload(EXAMPLE_URL, chunk_size, stream)
+        _fix_up_virtual(download)
+
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            await download._process_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert not download.finished
+        assert download.invalid
+        assert download.bytes_downloaded == 0
+        assert download.total_bytes is None
+
     def test_consume_next_chunk(self):
         download = _download.ChunkedDownload(EXAMPLE_URL, 256, None)
         with pytest.raises(NotImplementedError) as exc_info:
