@@ -1030,7 +1030,9 @@ class TestResumableUpload(object):
         _fix_up_virtual(upload)
 
         upload._invalid = True
-        upload._stream = mock.Mock(spec=["seek"])
+        upload._stream = mock.Mock(spec=["seek", "seekable", "tell"])
+        upload._stream.tell.return_value = 0
+        upload._stream.seekable.return_value = True
         upload._bytes_uploaded = mock.sentinel.not_zero
         assert upload.bytes_uploaded != 0
 
@@ -1071,9 +1073,105 @@ class TestResumableUpload(object):
         _fix_up_virtual(upload)
 
         upload._invalid = True
-        upload._stream = mock.Mock(spec=["seek"])
+        upload._stream = mock.Mock(spec=["seek", "seekable", "tell"])
+        upload._stream.tell.return_value = 12
+        upload._stream.seekable.return_value = True
         upload._bytes_uploaded = mock.sentinel.not_zero
         assert upload.bytes_uploaded != 0
+
+        end = 11
+        headers = {"range": "bytes=0-{:d}".format(end)}
+        response = _make_response(
+            status_code=http.client.PERMANENT_REDIRECT, headers=headers
+        )
+        ret_val = upload._process_recover_response(response)
+        assert ret_val is None
+        # Check the state of ``upload`` after.
+        assert upload.bytes_uploaded == end + 1
+        assert not upload.invalid
+        upload._stream.seek.assert_called_once_with(end + 1)
+
+    def test__process_recover_response_repeated_same_position(self):
+        data = b"recover me if you can"
+        upload = _upload.ResumableUpload(RESUMABLE_URL, ONE_MB)
+        _fix_up_virtual(upload)
+
+        upload._invalid = True
+        upload._stream = io.BytesIO(data)
+        # Simulate a failed chunk request: the whole stream was read
+        # locally, but the server only persisted part of it.
+        upload._stream.seek(0, io.SEEK_END)
+        upload._bytes_uploaded = len(data)
+
+        end = 6
+        headers = {"range": "bytes=0-{:d}".format(end)}
+        response = _make_response(
+            status_code=http.client.PERMANENT_REDIRECT, headers=headers
+        )
+        # Processing the same recovery response twice must be safe: the
+        # stream is rewound to the same position both times.
+        for _ in range(2):
+            upload._process_recover_response(response)
+            assert upload.bytes_uploaded == end + 1
+            assert upload._stream.tell() == end + 1
+            assert not upload.invalid
+            upload._invalid = True
+
+    def test__process_recover_response_range_beyond_bytes_read(self):
+        data = b"short"
+        upload = _upload.ResumableUpload(RESUMABLE_URL, ONE_MB)
+        _fix_up_virtual(upload)
+
+        upload._invalid = True
+        upload._stream = io.BytesIO(data)
+        upload._stream.seek(0, io.SEEK_END)
+        upload._bytes_uploaded = len(data)
+
+        # The server claims bytes the client never read from the stream.
+        headers = {"range": "bytes=0-{:d}".format(len(data) + 10)}
+        response = _make_response(
+            status_code=http.client.PERMANENT_REDIRECT, headers=headers
+        )
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            upload._process_recover_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert exc_info.match("ever been read")
+        # Check the state of ``upload`` after (untouched).
+        assert upload.bytes_uploaded == len(data)
+        assert upload.invalid
+        assert upload._stream.tell() == len(data)
+
+    def test__process_recover_response_non_seekable_stream(self):
+        upload = _upload.ResumableUpload(RESUMABLE_URL, ONE_MB)
+        _fix_up_virtual(upload)
+
+        upload._invalid = True
+        upload._stream = _NonSeekableStream()
+
+        end = 6
+        headers = {"range": "bytes=0-{:d}".format(end)}
+        response = _make_response(
+            status_code=http.client.PERMANENT_REDIRECT, headers=headers
+        )
+        with pytest.raises(ValueError) as exc_info:
+            upload._process_recover_response(response)
+
+        assert exc_info.match("not seekable")
+        # Check the state of ``upload`` after (untouched).
+        assert upload.bytes_uploaded == 0
+        assert upload.invalid
+
+    def test__process_recover_response_stream_without_seekable(self):
+        # Old-style streams may not define ``seekable()`` at all; recovery
+        # should still rewind them via ``seek()``.
+        upload = _upload.ResumableUpload(RESUMABLE_URL, ONE_MB)
+        _fix_up_virtual(upload)
+
+        upload._invalid = True
+        upload._stream = mock.Mock(spec=["seek", "tell"])
+        upload._stream.tell.return_value = 12
 
         end = 11
         headers = {"range": "bytes=0-{:d}".format(end)}
@@ -1506,6 +1604,19 @@ def _make_response(status_code=http.client.OK, headers=None, metadata=None):
         json=mock.Mock(return_value=metadata),
         spec=["headers", "status_code"],
     )
+
+
+class _NonSeekableStream(io.RawIOBase):
+    """A readable stream that cannot be rewound."""
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return False
+
+    def readinto(self, buffer):
+        return 0
 
 
 def _make_xml_response(status_code=http.client.OK, headers=None, text=None):

@@ -19,6 +19,9 @@ import pytest  # type: ignore
 import tempfile
 from unittest import mock
 
+import requests.exceptions
+
+from google.resumable_media import common
 import google.resumable_media.requests.upload as upload_mod
 
 
@@ -330,7 +333,9 @@ class TestResumableUpload(object):
     def test_recover(self):
         upload = upload_mod.ResumableUpload(RESUMABLE_URL, ONE_MB)
         upload._invalid = True  # Make sure invalid.
-        upload._stream = mock.Mock(spec=["seek"])
+        upload._stream = mock.Mock(spec=["seek", "seekable", "tell"])
+        upload._stream.tell.return_value = 55556
+        upload._stream.seekable.return_value = True
         upload._resumable_url = "http://test.invalid?upload_id=big-deal"
 
         end = 55555
@@ -351,6 +356,109 @@ class TestResumableUpload(object):
             headers=expected_headers,
             timeout=EXPECTED_TIMEOUT,
         )
+
+    def test_recover_and_resume_mid_chunk(self):
+        # Simulate a proxy dropping the connection while forwarding a chunk:
+        # the local stream has been read to the end of the chunk, but the
+        # server only persisted the first half of it. After recover(), the
+        # upload must resume from the next byte confirmed by the server.
+        data = b"0123456789ABCDEFGHIJ"
+        upload = upload_mod.ResumableUpload(
+            RESUMABLE_URL, ONE_MB, checksum="md5"
+        )
+        upload._retry_strategy = common.RetryStrategy(max_retries=0)
+        stream = io.BytesIO(data)
+
+        resumable_url = "http://test.invalid?upload_id=mid-chunk"
+        initiate_response = _make_response(headers={"location": resumable_url})
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = initiate_response
+        upload.initiate(transport, stream, {"name": "archive.tar"}, BASIC_CONTENT)
+        assert upload.total_bytes == len(data)
+
+        # The chunk request dies mid-flight. The payload was already read
+        # from the stream, so the stream position is at the chunk end.
+        transport.request.side_effect = requests.exceptions.ConnectionError(
+            "proxy dropped the connection"
+        )
+        with pytest.raises(requests.exceptions.ConnectionError):
+            upload.transmit_next_chunk(transport)
+        assert stream.tell() == len(data)
+        assert upload.bytes_uploaded == 0
+
+        # The server confirms it received only the first half of the chunk.
+        server_received = 10
+        recover_response = _make_response(
+            status_code=http.client.PERMANENT_REDIRECT,
+            headers={"range": "bytes=0-{:d}".format(server_received - 1)},
+        )
+        transport.request.side_effect = None
+        transport.request.return_value = recover_response
+        upload.recover(transport)
+        assert upload.bytes_uploaded == server_received
+        assert stream.tell() == server_received
+        assert not upload.invalid
+
+        # The resumed upload sends only the bytes the server is missing.
+        final_response = _make_response(
+            metadata={"md5Hash": "FiHRzgCU/BVFuqMWd97ulA=="}
+        )
+        transport.request.return_value = final_response
+        response = upload.transmit_next_chunk(transport)
+        assert response is final_response
+        assert upload.finished
+        assert upload.bytes_uploaded == len(data)
+
+        # Check every request actually sent: the failed chunk, the status
+        # probe and the resumed chunk.
+        expected_headers = {
+            "content-range": "bytes 0-{:d}/{:d}".format(len(data) - 1, len(data)),
+            "content-type": BASIC_CONTENT,
+        }
+        recover_headers = {"content-range": "bytes */*"}
+        resumed_headers = {
+            "content-range": "bytes {:d}-{:d}/{:d}".format(
+                server_received, len(data) - 1, len(data)
+            ),
+            "content-type": BASIC_CONTENT,
+        }
+        assert transport.request.call_args_list == [
+            mock.call(
+                "POST",
+                RESUMABLE_URL,
+                data=b'{"name": "archive.tar"}',
+                headers={
+                    "content-type": JSON_TYPE,
+                    "x-upload-content-type": BASIC_CONTENT,
+                    "x-upload-content-length": "{:d}".format(len(data)),
+                },
+                timeout=EXPECTED_TIMEOUT,
+            ),
+            mock.call(
+                "PUT",
+                resumable_url,
+                data=data,
+                headers=expected_headers,
+                timeout=EXPECTED_TIMEOUT,
+            ),
+            mock.call(
+                "PUT",
+                resumable_url,
+                data=None,
+                headers=recover_headers,
+                timeout=EXPECTED_TIMEOUT,
+            ),
+            mock.call(
+                "PUT",
+                resumable_url,
+                data=data[server_received:],
+                headers=resumed_headers,
+                timeout=EXPECTED_TIMEOUT,
+            ),
+        ]
+        # The re-transmitted bytes must not be checksummed twice: the final
+        # md5 covers the whole payload exactly once.
+        assert upload._bytes_checksummed == len(data)
 
 
 def test_mpu_container():
@@ -396,11 +504,12 @@ def test_mpu_part(filename):
     assert part.etag == PARTS[1]
 
 
-def _make_response(status_code=http.client.OK, headers=None, text=None):
+def _make_response(status_code=http.client.OK, headers=None, text=None, metadata=None):
     headers = headers or {}
     return mock.Mock(
         headers=headers,
         status_code=status_code,
         text=text,
+        json=mock.Mock(return_value=metadata),
         spec=["headers", "status_code", "text"],
     )

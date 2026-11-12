@@ -46,6 +46,8 @@ from google.resumable_media._upload import (
     _RELATED_HEADER,
     _BYTES_RANGE_RE,
     _STREAM_ERROR_TEMPLATE,
+    _STREAM_NOT_SEEKABLE_TEMPLATE,
+    _RECOVERY_RANGE_OVERFLOW_TEMPLATE,
     _POST,
     _PUT,
     _UPLOAD_CHECKSUM_MISMATCH_MESSAGE,
@@ -771,6 +773,11 @@ class ResumableUpload(UploadBase, sync_upload.ResumableUpload):
             ~google.resumable_media.common.InvalidResponse: If the status
                 code is 308 and the ``range`` header is not of the form
                 ``bytes 0-{end}``.
+            ~google.resumable_media.common.InvalidResponse: If the ``range``
+                header reports more bytes than have ever been read from the
+                local stream.
+            ValueError: If the local stream cannot be rewound (i.e. it is
+                not seekable) to the position confirmed by the server.
 
         .. _sans-I/O: https://sans-io.readthedocs.io/
         """
@@ -790,12 +797,30 @@ class ResumableUpload(UploadBase, sync_upload.ResumableUpload):
                     bytes_range,
                     'Expected to be of the form "bytes=0-{end}"',
                 )
-            self._bytes_uploaded = int(match.group("end_byte")) + 1
+            bytes_uploaded = int(match.group("end_byte")) + 1
         else:
             # In this case, the upload has not "begun".
-            self._bytes_uploaded = 0
+            bytes_uploaded = 0
 
-        self._stream.seek(self._bytes_uploaded)
+        # Recovery requires rewinding the stream to the position confirmed
+        # by the server, which is impossible for a non-seekable stream.
+        seekable = getattr(self._stream, "seekable", None)
+        if seekable is not None and not seekable():
+            raise ValueError(_STREAM_NOT_SEEKABLE_TEMPLATE.format(bytes_uploaded))
+
+        # The local stream position is the high-water mark of bytes the
+        # client has actually read (and thus could have sent). A failure can
+        # leave this position ahead of the server-confirmed progress, but the
+        # server can never confirm bytes the client never read.
+        bytes_read = self._stream.tell()
+        if bytes_uploaded > bytes_read:
+            raise common.InvalidResponse(
+                response,
+                _RECOVERY_RANGE_OVERFLOW_TEMPLATE.format(bytes_uploaded, bytes_read),
+            )
+
+        self._bytes_uploaded = bytes_uploaded
+        self._stream.seek(bytes_uploaded)
         self._invalid = False
 
     def recover(self, transport):
