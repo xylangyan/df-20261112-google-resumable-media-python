@@ -110,6 +110,25 @@ class DataCorruption(Exception):
         """object: The HTTP response object that caused the failure."""
 
 
+class PartConflict(Exception):
+    """Error class for conflicting part receipts in an XML MPU.
+
+    Raised when the same part number is associated with more than one
+    distinct ETag, e.g. when a receipt replayed after a process restart
+    does not match the ETag already recorded for that part number.
+
+    Args:
+        part_number (int): The part number with conflicting ETags.
+        args (tuple): The positional arguments typically passed to an
+            exception class.
+    """
+
+    def __init__(self, part_number, *args):
+        super(PartConflict, self).__init__(*args)
+        self.part_number = part_number
+        """int: The part number whose receipts conflict."""
+
+
 class RetryStrategy(object):
     """Configuration class for retrying failed requests.
 

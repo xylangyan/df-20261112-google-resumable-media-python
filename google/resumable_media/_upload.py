@@ -74,6 +74,25 @@ _MPU_PART_QUERY_TEMPLATE = "?partNumber={part}&uploadId={upload_id}"
 _S3_COMPAT_XML_NAMESPACE = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 _UPLOAD_ID_NODE = "UploadId"
 _MPU_FINAL_QUERY_TEMPLATE = "?uploadId={upload_id}"
+_MPU_PART_CONFLICT_MESSAGE = (
+    "Part {part_number} was registered with ETag {existing}, but a receipt "
+    "with the same part number and a different ETag {incoming} was received. "
+    "The upload cannot be finalized until the conflict is resolved."
+)
+_MPU_NO_PARTS_MESSAGE = (
+    "No parts have been registered for this upload. The upload cannot be "
+    "finalized with an empty part list."
+)
+_MPU_MISSING_PARTS_MESSAGE = (
+    "Parts {missing} are expected for this upload but have not been "
+    "registered. The upload cannot be finalized until every expected part "
+    "has been uploaded and registered."
+)
+_MPU_UNEXPECTED_PARTS_MESSAGE = (
+    "Parts {unexpected} are registered but are not among the expected parts "
+    "for this upload. The upload cannot be finalized with parts that do not "
+    "belong to the current target."
+)
 
 
 class UploadBase(object):
@@ -894,6 +913,18 @@ class XMLMPUContainer(UploadBase):
         filename (str): The name (path) of the file to upload.
         headers (Optional[Mapping[str, str]]): Extra headers that should
             be sent with every request.
+        upload_id (Optional[str]): The ID of an already-initiated upload, e.g.
+            one persisted by a previous process. Passing an upload ID resumes
+            that upload instead of initiating a new one.
+        parts (Optional[Union[Mapping[int, str], Iterable[Tuple[int, str]]]]):
+            Receipts of parts already uploaded under ``upload_id``, either as
+            a mapping of part number to ETag or as an iterable of
+            ``(part_number, etag)`` pairs. Each receipt is validated with
+            :meth:`register_part`, so identical duplicates are replayed
+            harmlessly while conflicting ETags raise an error.
+        expected_parts (Optional[Iterable[int]]): The part numbers of the
+            current upload target. If provided, the upload cannot be
+            finalized until exactly these parts have been registered.
 
     Attributes:
         upload_url (str): The URL where the content will be uploaded.
@@ -901,11 +932,72 @@ class XMLMPUContainer(UploadBase):
             response.
     """
 
-    def __init__(self, upload_url, filename, headers=None, upload_id=None):
+    def __init__(
+        self,
+        upload_url,
+        filename,
+        headers=None,
+        upload_id=None,
+        parts=None,
+        expected_parts=None,
+    ):
         super().__init__(upload_url, headers=headers)
         self._filename = filename
         self._upload_id = upload_id
         self._parts = {}
+        if parts is not None:
+            if hasattr(parts, "items"):
+                parts = parts.items()
+            for part_number, etag in parts:
+                self.register_part(part_number, etag)
+        self._expected_parts = None if expected_parts is None else set(expected_parts)
+
+    @classmethod
+    def resume(
+        cls,
+        upload_url,
+        filename,
+        upload_id,
+        parts,
+        expected_parts=None,
+        headers=None,
+    ):
+        """Resume an upload initiated by a previous process.
+
+        A process that restarts mid-upload can reattach to the upload ID it
+        persisted locally instead of initiating a new upload and re-sending
+        every part. The persisted part receipts are replayed through
+        :meth:`register_part`, so receipts that arrived more than once are
+        deduplicated and receipts that conflict with each other raise
+        :class:`~google.resumable_media.common.PartConflict`.
+
+        Args:
+            upload_url (str): The URL of the object (without query
+                parameters).
+            filename (str): The name (path) of the file being uploaded.
+            upload_id (str): The ID of the upload to resume, as persisted
+                before the restart.
+            parts (Union[Mapping[int, str], Iterable[Tuple[int, str]]]):
+                Receipts of parts already uploaded under ``upload_id``,
+                either as a mapping of part number to ETag or as an iterable
+                of ``(part_number, etag)`` pairs.
+            expected_parts (Optional[Iterable[int]]): The part numbers of
+                the current upload target. If provided, the upload cannot be
+                finalized until exactly these parts have been registered.
+            headers (Optional[Mapping[str, str]]): Extra headers that should
+                be sent with every request.
+
+        Returns:
+            XMLMPUContainer: A container attached to the existing upload.
+        """
+        return cls(
+            upload_url,
+            filename,
+            headers=headers,
+            upload_id=upload_id,
+            parts=parts,
+            expected_parts=expected_parts,
+        )
 
     @property
     def upload_id(self):
@@ -922,12 +1014,31 @@ class XMLMPUContainer(UploadBase):
         themselves, to reduce the complexity involved in running XMLMPUPart
         uploads in separate processes.
 
+        Registering the same part number with the same etag again is a
+        harmless no-op, so receipts replayed after a restart do not need to
+        be deduplicated by the caller. Registering the same part number with
+        a different etag indicates conflicting content and raises an error.
+
         Args:
             part_number (int): The part number. Parts are assembled into the
                 final uploaded object with finalize() in order of their part
                 numbers.
             etag (str): The etag included in the server response after upload.
+
+        Raises:
+            ~google.resumable_media.common.PartConflict: If the part number
+                was already registered with a different etag.
         """
+        existing_etag = self._parts.get(part_number)
+        if existing_etag is not None and existing_etag != etag:
+            raise common.PartConflict(
+                part_number,
+                _MPU_PART_CONFLICT_MESSAGE.format(
+                    part_number=part_number,
+                    existing=existing_etag,
+                    incoming=etag,
+                ),
+            )
         self._parts[part_number] = etag
 
     def _prepare_initiate_request(self, content_type):
@@ -1015,10 +1126,46 @@ class XMLMPUContainer(UploadBase):
         """
         raise NotImplementedError("This implementation is virtual.")
 
+    def _validate_parts(self):
+        """Check that the registered parts satisfy the upload target.
+
+        This is everything that must be verified before a finalize request
+        can be built. Part numbers are unique by construction (each is a
+        key of the internal mapping), so the checks focus on completeness:
+
+        * at least one part must be registered
+        * if expected parts were supplied, none may be missing
+        * if expected parts were supplied, no unexpected part may be
+          registered
+
+        Raising here, before the request is returned, guarantees that an
+        incomplete or mismatched manifest never reaches the server.
+
+        Raises:
+            ValueError: If no parts are registered, expected parts are
+                missing, or unexpected parts are registered.
+        """
+        registered = set(self._parts)
+        if not registered:
+            raise ValueError(_MPU_NO_PARTS_MESSAGE)
+        if self._expected_parts is not None:
+            missing = sorted(self._expected_parts - registered)
+            if missing:
+                raise ValueError(_MPU_MISSING_PARTS_MESSAGE.format(missing=missing))
+            unexpected = sorted(registered - self._expected_parts)
+            if unexpected:
+                raise ValueError(
+                    _MPU_UNEXPECTED_PARTS_MESSAGE.format(unexpected=unexpected)
+                )
+
     def _prepare_finalize_request(self):
         """Prepare the contents of an HTTP request to finalize the upload.
 
-        All of the parts must be registered before calling this method.
+        All of the parts must be registered before calling this method. The
+        parts are checked against the upload target first, and the
+        ``CompleteMultipartUpload`` XML lists them in ascending part-number
+        order as required by the protocol, regardless of the order in which
+        their receipts were registered.
 
         Returns:
             Tuple[str, str, bytes, Mapping[str, str]]: The quadruple
@@ -1030,17 +1177,21 @@ class XMLMPUContainer(UploadBase):
 
         Raises:
             ValueError: If the upload has not been initiated.
+            ValueError: If no parts are registered, expected parts are
+                missing, or unexpected parts are registered.
         """
         if self.upload_id is None:
             raise ValueError("This upload has not yet been initiated.")
 
+        self._validate_parts()
+
         final_query = _MPU_FINAL_QUERY_TEMPLATE.format(upload_id=self._upload_id)
         finalize_url = self.upload_url + final_query
         final_xml_root = ElementTree.Element("CompleteMultipartUpload")
-        for part_number, etag in self._parts.items():
-            part = ElementTree.SubElement(final_xml_root, "Part")  # put in a loop
+        for part_number in sorted(self._parts):
+            part = ElementTree.SubElement(final_xml_root, "Part")
             ElementTree.SubElement(part, "PartNumber").text = str(part_number)
-            ElementTree.SubElement(part, "ETag").text = etag
+            ElementTree.SubElement(part, "ETag").text = self._parts[part_number]
         payload = ElementTree.tostring(final_xml_root)
         return _POST, finalize_url, payload, self._headers
 

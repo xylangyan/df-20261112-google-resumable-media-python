@@ -19,6 +19,7 @@ import tempfile
 
 from unittest import mock
 import pytest  # type: ignore
+from xml.etree import ElementTree
 
 from google.resumable_media import _helpers
 from google.resumable_media import _upload
@@ -1329,6 +1330,134 @@ def test_xml_mpu_container_finalize(filename):
 
     with pytest.raises(NotImplementedError):
         container.finalize(None)
+
+
+def test_xml_mpu_container_resume(filename):
+    manifest = [
+        (2, "etag-two"),
+        (1, "etag-one"),
+        (3, "etag-three"),
+    ]
+
+    container = _upload.XMLMPUContainer.resume(
+        EXAMPLE_XML_UPLOAD_URL,
+        filename,
+        UPLOAD_ID,
+        manifest,
+        expected_parts=[1, 2, 3],
+        headers=EXAMPLE_HEADERS,
+    )
+
+    # The existing upload is taken over, no new upload is initiated.
+    assert container.upload_id == UPLOAD_ID
+    assert container._headers == EXAMPLE_HEADERS
+    assert container._expected_parts == {1, 2, 3}
+    assert container._parts == {1: "etag-one", 2: "etag-two", 3: "etag-three"}
+    with pytest.raises(ValueError):
+        container._prepare_initiate_request(BASIC_CONTENT)
+
+    # A mapping manifest and constructor keyword arguments work too.
+    container = _upload.XMLMPUContainer(
+        EXAMPLE_XML_UPLOAD_URL,
+        filename,
+        upload_id=UPLOAD_ID,
+        parts={1: "etag-one", 2: "etag-two", 3: "etag-three"},
+    )
+    assert container.upload_id == UPLOAD_ID
+    assert container._parts == {1: "etag-one", 2: "etag-two", 3: "etag-three"}
+
+
+def test_xml_mpu_container_resume_conflicting_manifest(filename):
+    # The same part number with two different ETags cannot be reconciled.
+    manifest = [(1, "etag-one"), (1, "etag-one-again"), (2, "etag-two")]
+
+    with pytest.raises(common.PartConflict) as exc_info:
+        _upload.XMLMPUContainer.resume(
+            EXAMPLE_XML_UPLOAD_URL, filename, UPLOAD_ID, manifest
+        )
+    assert exc_info.value.part_number == 1
+
+
+def test_xml_mpu_container_register_part_replay_and_conflict(filename):
+    container = _upload.XMLMPUContainer(
+        EXAMPLE_XML_UPLOAD_URL, filename, upload_id=UPLOAD_ID
+    )
+
+    # Replaying an identical receipt is a harmless no-op.
+    container.register_part(1, "etag-one")
+    container.register_part(1, "etag-one")
+    assert container._parts == {1: "etag-one"}
+
+    # The same part number with a different ETag is a real conflict.
+    with pytest.raises(common.PartConflict) as exc_info:
+        container.register_part(1, "etag-one-changed")
+    assert exc_info.value.part_number == 1
+    assert container._parts == {1: "etag-one"}
+
+
+def test_xml_mpu_container_finalize_sorted(filename):
+    container = _upload.XMLMPUContainer(
+        EXAMPLE_XML_UPLOAD_URL,
+        filename,
+        headers=EXAMPLE_HEADERS,
+        upload_id=UPLOAD_ID,
+        expected_parts=[1, 2, 3],
+    )
+    # Report the three parts in reverse order, plus a replayed receipt.
+    for part_number, etag in [
+        (3, "etag-three"),
+        (2, "etag-two"),
+        (1, "etag-one"),
+        (2, "etag-two"),
+    ]:
+        container.register_part(part_number, etag)
+
+    verb, url, body, headers = container._prepare_finalize_request()
+    assert verb == _upload._POST
+    final_query = _upload._MPU_FINAL_QUERY_TEMPLATE.format(upload_id=UPLOAD_ID)
+    assert url == EXAMPLE_XML_UPLOAD_URL + final_query
+    assert headers == EXAMPLE_HEADERS
+
+    # The completion XML must follow protocol order: ascending part numbers.
+    root = ElementTree.fromstring(body)
+    part_numbers = [
+        int(node.find("PartNumber").text) for node in root.findall("Part")
+    ]
+    assert part_numbers == [1, 2, 3]
+    etags = [node.find("ETag").text for node in root.findall("Part")]
+    assert etags == ["etag-one", "etag-two", "etag-three"]
+
+
+def test_xml_mpu_container_finalize_missing_parts(filename):
+    container = _upload.XMLMPUContainer(
+        EXAMPLE_XML_UPLOAD_URL,
+        filename,
+        upload_id=UPLOAD_ID,
+        parts={1: "etag-one", 3: "etag-three"},
+        expected_parts=[1, 2, 3],
+    )
+    with pytest.raises(ValueError):
+        container._prepare_finalize_request()
+
+
+def test_xml_mpu_container_finalize_unexpected_parts(filename):
+    container = _upload.XMLMPUContainer(
+        EXAMPLE_XML_UPLOAD_URL,
+        filename,
+        upload_id=UPLOAD_ID,
+        parts={1: "etag-one", 2: "etag-two", 3: "etag-three"},
+        expected_parts=[1, 2],
+    )
+    with pytest.raises(ValueError):
+        container._prepare_finalize_request()
+
+
+def test_xml_mpu_container_finalize_no_parts(filename):
+    container = _upload.XMLMPUContainer(
+        EXAMPLE_XML_UPLOAD_URL, filename, upload_id=UPLOAD_ID
+    )
+    with pytest.raises(ValueError):
+        container._prepare_finalize_request()
 
 
 def test_xml_mpu_container_cancel(filename):

@@ -18,7 +18,9 @@ import json
 import pytest  # type: ignore
 import tempfile
 from unittest import mock
+from xml.etree import ElementTree
 
+from google.resumable_media import common
 import google.resumable_media.requests.upload as upload_mod
 
 
@@ -372,6 +374,89 @@ def test_mpu_container():
     transport.request.return_value = _make_response()
     container.finalize(transport)
     assert container.finished
+
+
+def test_mpu_container_resume_finalize_body_is_sorted():
+    # A restarted process resumes the same upload ID with locally persisted
+    # receipts: the three parts arrive in reverse order and part 2 carries a
+    # replayed (identical) receipt.
+    manifest = [
+        (3, "etag-three"),
+        (2, "etag-two"),
+        (1, "etag-one"),
+        (2, "etag-two"),
+    ]
+    container = upload_mod.XMLMPUContainer.resume(
+        EXAMPLE_XML_UPLOAD_URL,
+        filename,
+        UPLOAD_ID,
+        manifest,
+        expected_parts=[1, 2, 3],
+    )
+
+    transport = mock.Mock(spec=["request"])
+    transport.request.return_value = _make_response()
+    container.finalize(transport)
+
+    # Intercept the actual final request body and inspect the XML.
+    assert transport.request.call_count == 1
+    _, kwargs = transport.request.call_args
+    body = kwargs["data"]
+    root = ElementTree.fromstring(body)
+    parts = [
+        (int(node.find("PartNumber").text), node.find("ETag").text)
+        for node in root.findall("Part")
+    ]
+    # The completion XML follows protocol order, not receipt arrival order,
+    # and the replayed receipt produces a single Part entry.
+    assert parts == [
+        (1, "etag-one"),
+        (2, "etag-two"),
+        (3, "etag-three"),
+    ]
+    assert container.finished
+
+
+def test_mpu_container_resume_conflict_never_sends_finalize():
+    # A conflicting receipt (same part number, different ETag) fails at
+    # resume time, so the complete request is never built or sent.
+    manifest = [
+        (3, "etag-three"),
+        (2, "etag-two"),
+        (1, "etag-one"),
+        (2, "etag-two-changed"),
+    ]
+    transport = mock.Mock(spec=["request"])
+
+    with pytest.raises(common.PartConflict):
+        upload_mod.XMLMPUContainer.resume(
+            EXAMPLE_XML_UPLOAD_URL,
+            filename,
+            UPLOAD_ID,
+            manifest,
+            expected_parts=[1, 2, 3],
+        )
+    transport.request.assert_not_called()
+
+
+def test_mpu_container_resume_missing_part_never_sends_finalize():
+    # The manifest is internally consistent but the target needs three parts
+    # and part 2 is missing, so finalize must not send the complete request.
+    manifest = [(3, "etag-three"), (1, "etag-one")]
+    container = upload_mod.XMLMPUContainer.resume(
+        EXAMPLE_XML_UPLOAD_URL,
+        filename,
+        UPLOAD_ID,
+        manifest,
+        expected_parts=[1, 2, 3],
+    )
+
+    transport = mock.Mock(spec=["request"])
+    transport.request.return_value = _make_response()
+    with pytest.raises(ValueError):
+        container.finalize(transport)
+    transport.request.assert_not_called()
+    assert not container.finished
 
 
 def test_mpu_container_cancel():
