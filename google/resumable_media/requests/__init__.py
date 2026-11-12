@@ -290,6 +290,35 @@ Usually, no checksum is returned with a chunked download. Even if one is returne
 it is not validated. If you need to validate the checksum, you can do so
 by buffering the chunks and validating the checksum against the completed download.
 
+====================
+Local File Downloads
+====================
+
+When a downstream consumer (for example a parser in an ingestion pipeline)
+only ever reads a fixed destination path, use :class:`.FileDownload`. It
+writes to an unpublished staging file next to the destination and only
+publishes the result with :func:`os.replace` once the full response has
+arrived and its checksum matches the value advertised by the source::
+
+   from google.resumable_media.requests import FileDownload
+
+   download = FileDownload(media_url, "/data/current/snapshot.bin")
+   download.consume(transport)
+
+If the destination already exists it is left untouched until the new file
+is fully verified, so it keeps serving the previous-generation snapshot
+while the download is in progress and after a cancellation or checksum
+failure. The three failure categories are distinct exceptions:
+
+* :exc:`.ChecksumMismatchError` - the bytes do not match the source checksum.
+* :exc:`.MissingChecksum` - the source did not advertise the requested checksum.
+* :exc:`.LocalWriteError` - the staging file could not be written or moved.
+
+The older :class:`.Download` / :class:`.RawDownload` interfaces that accept
+an arbitrary ``stream`` keep their streaming behavior: bytes become visible
+to the stream as they are downloaded, and no atomic publication is promised
+there.
+
 ==============
 Simple Uploads
 ==============
@@ -664,9 +693,14 @@ transmitted in chunks until completion:
 """
 from google.resumable_media.requests.download import ChunkedDownload
 from google.resumable_media.requests.download import Download
+from google.resumable_media.requests.download import download_to_file
+from google.resumable_media.requests.download import DownloadToFile
+from google.resumable_media.requests.download import FileDownload
 from google.resumable_media.requests.upload import MultipartUpload
 from google.resumable_media.requests.download import RawChunkedDownload
 from google.resumable_media.requests.download import RawDownload
+from google.resumable_media.requests.download import RawDownloadToFile
+from google.resumable_media.requests.download import RawFileDownload
 from google.resumable_media.requests.upload import ResumableUpload
 from google.resumable_media.requests.upload import SimpleUpload
 from google.resumable_media.requests.upload import XMLMPUContainer
@@ -675,9 +709,14 @@ from google.resumable_media.requests.upload import XMLMPUPart
 __all__ = [
     "ChunkedDownload",
     "Download",
+    "download_to_file",
+    "DownloadToFile",
+    "FileDownload",
     "MultipartUpload",
     "RawChunkedDownload",
     "RawDownload",
+    "RawDownloadToFile",
+    "RawFileDownload",
     "ResumableUpload",
     "SimpleUpload",
     "XMLMPUContainer",

@@ -25,6 +25,7 @@ from google.resumable_media import _helpers as sync_helpers
 from google.resumable_media.requests import download
 
 _CHECKSUM_MISMATCH = download._CHECKSUM_MISMATCH
+_MISSING_CHECKSUM = download._MISSING_CHECKSUM
 
 
 class Download(_request_helpers.RequestsMixin, _download.Download):
@@ -278,6 +279,251 @@ class RawDownload(_request_helpers.RawRequestsMixin, _download.Download):
             await self._write_to_stream(result)
 
         return result
+
+
+class FileDownload(Download):
+    """Async counterpart of :class:`download.FileDownload`.
+
+    Downloads into an unpublished staging file next to ``destination`` and
+    only publishes it (via :func:`os.replace`) once every segment has been
+    received and the checksum matches the source. On cancellation,
+    checksum failure, a missing expected checksum or a local write error,
+    the staging file is discarded and ``destination`` is left untouched so
+    an older snapshot remains readable.
+    """
+
+    def __init__(
+        self,
+        media_url,
+        destination,
+        start=None,
+        end=None,
+        headers=None,
+        checksum="md5",
+    ):
+        super(FileDownload, self).__init__(
+            media_url,
+            stream=None,
+            start=start,
+            end=end,
+            headers=headers,
+            checksum=checksum,
+        )
+        self.destination = destination
+        self.staging_path = None
+        self._require_checksum = checksum is not None
+        self._expected_checksum = None
+        self._checksum_object = None
+        self._published = False
+
+    def _checksum_mismatch_error(self, response, message):
+        return common.ChecksumMismatchError(response, message)
+
+    def _write_chunk(self, chunk):
+        try:
+            self._stream.write(chunk)
+        except OSError as exc:
+            raise common.LocalWriteError(exc, path=self.staging_path) from exc
+
+    async def _write_to_stream(self, response):
+        expected_checksum, checksum_object = sync_helpers._get_expected_checksum(
+            response, self._get_headers, self.media_url, checksum_type=self.checksum
+        )
+        self._expected_checksum = expected_checksum
+        self._checksum_object = checksum_object
+
+        if (
+            self._require_checksum
+            and expected_checksum is None
+            and response.status != http.client.PARTIAL_CONTENT
+        ):
+            msg = _MISSING_CHECKSUM.format(
+                self.media_url, checksum_type=self.checksum.upper()
+            )
+            raise common.MissingChecksum(response, msg)
+
+        local_checksum_object = _add_decoder(response, checksum_object)
+        async for chunk in response.content.iter_chunked(
+            _request_helpers._SINGLE_GET_CHUNK_SIZE
+        ):
+            self._write_chunk(chunk)
+            local_checksum_object.update(chunk)
+
+        if (
+            expected_checksum is not None
+            and response.status != http.client.PARTIAL_CONTENT
+        ):
+            actual_checksum = sync_helpers.prepare_checksum_digest(
+                checksum_object.digest()
+            )
+            if actual_checksum != expected_checksum:
+                msg = _CHECKSUM_MISMATCH.format(
+                    self.media_url,
+                    expected_checksum,
+                    actual_checksum,
+                    checksum_type=self.checksum.upper(),
+                )
+                raise self._checksum_mismatch_error(response, msg)
+
+    _open_staging_file = download.FileDownload._open_staging_file
+    _publish = download.FileDownload._publish
+    _discard_staging_file = download.FileDownload._discard_staging_file
+    _verify_staging_file = download.FileDownload._verify_staging_file
+
+    async def _consume_and_publish(self, do_consume):
+        stream = self._open_staging_file()
+        self._stream = stream
+        close_error = None
+        try:
+            result = await do_consume()
+            try:
+                stream.flush()
+            except OSError as exc:
+                raise common.LocalWriteError(exc, path=self.staging_path)
+        except BaseException:
+            self._stream = None
+            try:
+                stream.close()
+            except OSError:
+                pass
+            self._discard_staging_file()
+            raise
+
+        self._stream = None
+        try:
+            stream.close()
+        except OSError as exc:
+            close_error = exc
+
+        if close_error is not None:
+            self._discard_staging_file()
+            raise common.LocalWriteError(close_error, path=self.staging_path)
+
+        try:
+            self._verify_staging_file(result)
+            self._publish()
+        except BaseException:
+            self._discard_staging_file()
+            raise
+        self.staging_path = None
+        return result
+
+    async def consume(self, transport, timeout=_request_helpers._DEFAULT_TIMEOUT):
+        async def do_consume():
+            return await super(FileDownload, self).consume(
+                transport, timeout=timeout
+            )
+
+        return await self._consume_and_publish(do_consume)
+
+
+class RawFileDownload(RawDownload):
+    """Raw variant of :class:`FileDownload`."""
+
+    def __init__(
+        self,
+        media_url,
+        destination,
+        start=None,
+        end=None,
+        headers=None,
+        checksum="md5",
+    ):
+        super(RawFileDownload, self).__init__(
+            media_url,
+            stream=None,
+            start=start,
+            end=end,
+            headers=headers,
+            checksum=checksum,
+        )
+        self.destination = destination
+        self.staging_path = None
+        self._require_checksum = checksum is not None
+        self._expected_checksum = None
+        self._checksum_object = None
+        self._published = False
+
+    _checksum_mismatch_error = FileDownload._checksum_mismatch_error
+    _write_chunk = FileDownload._write_chunk
+    _open_staging_file = FileDownload._open_staging_file
+    _publish = FileDownload._publish
+    _discard_staging_file = FileDownload._discard_staging_file
+    _verify_staging_file = FileDownload._verify_staging_file
+    _consume_and_publish = FileDownload._consume_and_publish
+
+    async def _write_to_stream(self, response):
+        expected_checksum, checksum_object = sync_helpers._get_expected_checksum(
+            response, self._get_headers, self.media_url, checksum_type=self.checksum
+        )
+        self._expected_checksum = expected_checksum
+        self._checksum_object = checksum_object
+
+        if (
+            self._require_checksum
+            and expected_checksum is None
+            and response.status != http.client.PARTIAL_CONTENT
+        ):
+            msg = _MISSING_CHECKSUM.format(
+                self.media_url, checksum_type=self.checksum.upper()
+            )
+            raise common.MissingChecksum(response, msg)
+
+        async for chunk in response.content.iter_chunked(
+            _request_helpers._SINGLE_GET_CHUNK_SIZE
+        ):
+            self._write_chunk(chunk)
+            checksum_object.update(chunk)
+
+        if (
+            expected_checksum is not None
+            and response.status != http.client.PARTIAL_CONTENT
+        ):
+            actual_checksum = sync_helpers.prepare_checksum_digest(
+                checksum_object.digest()
+            )
+            if actual_checksum != expected_checksum:
+                msg = _CHECKSUM_MISMATCH.format(
+                    self.media_url,
+                    expected_checksum,
+                    actual_checksum,
+                    checksum_type=self.checksum.upper(),
+                )
+                raise self._checksum_mismatch_error(response, msg)
+
+    async def consume(self, transport, timeout=_request_helpers._DEFAULT_TIMEOUT):
+        async def do_consume():
+            return await super(RawFileDownload, self).consume(
+                transport, timeout=timeout
+            )
+
+        return await self._consume_and_publish(do_consume)
+
+
+DownloadToFile = FileDownload
+RawDownloadToFile = RawFileDownload
+
+
+async def download_to_file(
+    media_url,
+    destination,
+    transport,
+    start=None,
+    end=None,
+    headers=None,
+    checksum="md5",
+    timeout=_request_helpers._DEFAULT_TIMEOUT,
+):
+    """Async convenience wrapper around :class:`FileDownload`."""
+    download_obj = FileDownload(
+        media_url,
+        destination,
+        start=start,
+        end=end,
+        headers=headers,
+        checksum=checksum,
+    )
+    return await download_obj.consume(transport, timeout=timeout)
 
 
 class ChunkedDownload(_request_helpers.RequestsMixin, _download.ChunkedDownload):

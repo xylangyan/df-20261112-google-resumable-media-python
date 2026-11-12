@@ -43,8 +43,11 @@ To install with `pip`_:
 """
 
 
+from google.resumable_media.common import ChecksumMismatchError
 from google.resumable_media.common import DataCorruption
 from google.resumable_media.common import InvalidResponse
+from google.resumable_media.common import LocalWriteError
+from google.resumable_media.common import MissingChecksum
 from google.resumable_media.common import PERMANENT_REDIRECT
 from google.resumable_media.common import RetryStrategy
 from google.resumable_media.common import TOO_MANY_REQUESTS
@@ -52,8 +55,11 @@ from google.resumable_media.common import UPLOAD_CHUNK_SIZE
 
 
 __all__ = [
+    "ChecksumMismatchError",
     "DataCorruption",
     "InvalidResponse",
+    "LocalWriteError",
+    "MissingChecksum",
     "PERMANENT_REDIRECT",
     "RetryStrategy",
     "TOO_MANY_REQUESTS",

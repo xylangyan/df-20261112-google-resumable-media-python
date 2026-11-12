@@ -27,6 +27,43 @@ class TestInvalidResponse(object):
         assert error.args == (1, "a", [b"m"], True)
 
 
+class TestChecksumMismatchError(object):
+    def test_is_data_corruption(self):
+        response = mock.sentinel.response
+        error = common.ChecksumMismatchError(response, "bad")
+
+        assert isinstance(error, common.DataCorruption)
+        assert error.response is response
+        assert error.args == ("bad",)
+
+
+class TestMissingChecksum(object):
+    def test_is_invalid_response(self):
+        response = mock.sentinel.response
+        error = common.MissingChecksum(response, "no checksum")
+
+        assert isinstance(error, common.InvalidResponse)
+        assert error.response is response
+        assert error.args == ("no checksum",)
+
+
+class TestLocalWriteError(object):
+    def test_wraps_oserror(self):
+        os_error = OSError(28, "No space left on device")
+        error = common.LocalWriteError(os_error, path="/tmp/staging.part")
+
+        assert isinstance(error, OSError)
+        assert error.error is os_error
+        assert error.path == "/tmp/staging.part"
+        assert error.errno == 28
+        assert "No space left on device" in str(error)
+        assert error.__cause__ is os_error
+
+    def test_missing_errno(self):
+        error = common.LocalWriteError(OSError("boom"))
+        assert error.errno == 0
+
+
 class TestRetryStrategy(object):
     def test_constructor_defaults(self):
         retry_strategy = common.RetryStrategy()

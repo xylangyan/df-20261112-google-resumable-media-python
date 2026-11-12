@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import hashlib
 import http.client
 import io
+import os
 
 from unittest import mock
 import pytest  # type: ignore
@@ -1227,6 +1230,381 @@ class TestRawChunkedDownload(object):
         assert not download.finished
         assert download.bytes_downloaded == chunk_size
         assert download.total_bytes == total_bytes
+
+
+class TestFileDownload(object):
+    """Tests for the local-file download entry point.
+
+    Each test works inside a temporary directory that already contains a
+    previous-generation snapshot at the destination path. The parser only
+    ever reads that fixed path, so the snapshot must remain readable
+    unless a fully verified new file is published in its place.
+    """
+
+    def _make_download(self, destination, checksum="md5", start=None, end=None):
+        return download_mod.FileDownload(
+            EXAMPLE_URL,
+            destination,
+            start=start,
+            end=end,
+            checksum=checksum,
+        )
+
+    def _consume(self, download, chunks, headers=None):
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _mock_response(
+            chunks=chunks, headers=headers
+        )
+        return download.consume(transport)
+
+    def test_constructor(self, tmp_path):
+        destination = str(tmp_path / "data.bin")
+        download = self._make_download(destination)
+
+        assert download.destination == destination
+        assert download.staging_path is None
+        assert download._require_checksum
+        assert not download.finished
+        assert not download._published
+
+    def test_constructor_checksum_none_disables_requirement(self, tmp_path):
+        download = self._make_download(str(tmp_path / "data.bin"), checksum=None)
+        assert not download._require_checksum
+
+    def test_aliases(self):
+        assert download_mod.DownloadToFile is download_mod.FileDownload
+        assert download_mod.RawDownloadToFile is download_mod.RawFileDownload
+
+    @pytest.mark.parametrize("checksum", ["md5", "crc32c"])
+    def test_consume_publishes_verified_file(self, tmp_path, checksum):
+        # Previous-generation snapshot that the parser may still be reading.
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        chunks = (b"first segment, ", b"second segment, ", b"final segment")
+        payload = b"".join(chunks)
+        md5 = base64.b64encode(hashlib.md5(payload).digest()).decode("utf-8")
+        crc_obj = _helpers._get_crc32c_object()
+        crc_obj.update(payload)
+        crc32c = base64.b64encode(crc_obj.digest()).decode("utf-8")
+        headers = {
+            _helpers._HASH_HEADER: "crc32c={crc},md5={md5}".format(
+                crc=crc32c, md5=md5
+            )
+        }
+
+        download = self._make_download(str(destination), checksum=checksum)
+        response = self._consume(download, chunks, headers=headers)
+
+        assert response is not None
+        assert download.finished
+        assert download._published
+        assert download.staging_path is None
+
+        # The new, verified bytes replaced the old snapshot.
+        assert destination.read_bytes() == b"".join(chunks)
+        # The staging file was moved, leaving the directory clean.
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    def test_consume_final_segment_corrupt_keeps_old_snapshot(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        # The source advertises the checksum of the *correct* payload, but
+        # the final segment arrives corrupted.
+        good_chunks = (b"first segment, ", b"second segment, ", b"final segment")
+        corrupt_chunks = good_chunks[:-1] + (b"final segmenX",)
+        expected_md5 = hashlib.md5(b"".join(good_chunks)).digest()
+        headers = {
+            _helpers._HASH_HEADER: "md5={}".format(
+                base64.b64encode(expected_md5).decode("utf-8")
+            )
+        }
+
+        download = self._make_download(str(destination))
+        with pytest.raises(common.ChecksumMismatchError) as exc_info:
+            self._consume(download, corrupt_chunks, headers=headers)
+
+        # The specialized error is still a DataCorruption for old callers.
+        assert isinstance(exc_info.value, common.DataCorruption)
+        assert exc_info.value.response is not None
+
+        # The old snapshot is untouched and still readable.
+        assert destination.read_bytes() == old_snapshot
+        # The staging file was discarded; nothing unpublished lingers.
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+        assert download.staging_path is None
+        assert not download._published
+
+    def test_consume_missing_expected_checksum(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        # The source returns no checksum header at all.
+        chunks = (b"first segment, ", b"final segment")
+        download = self._make_download(str(destination))
+        with pytest.raises(common.MissingChecksum) as exc_info:
+            self._consume(download, chunks, headers={})
+
+        assert isinstance(exc_info.value, common.InvalidResponse)
+        assert "MD5" in str(exc_info.value)
+
+        # The old snapshot is untouched and still readable.
+        assert destination.read_bytes() == old_snapshot
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    def test_consume_missing_checksum_allowed_when_disabled(self, tmp_path):
+        destination = tmp_path / "data.bin"
+        chunks = (b"first segment, ", b"final segment")
+        download = self._make_download(str(destination), checksum=None)
+        self._consume(download, chunks, headers={})
+
+        assert destination.read_bytes() == b"".join(chunks)
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    def test_consume_local_write_error(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        chunks = (b"first segment, ", b"final segment")
+        download = self._make_download(str(destination), checksum=None)
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _mock_response(chunks=chunks)
+
+        with mock.patch.object(
+            download_mod.FileDownload,
+            "_write_chunk",
+            side_effect=common.LocalWriteError(
+                OSError(28, "No space left on device")
+            ),
+        ):
+            with pytest.raises(common.LocalWriteError) as exc_info:
+                download.consume(transport)
+
+        assert isinstance(exc_info.value, OSError)
+
+        # The old snapshot is untouched and still readable.
+        assert destination.read_bytes() == old_snapshot
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    def test_consume_cancellation_keeps_old_snapshot(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        chunks = (b"first segment, ", b"final segment")
+        download = self._make_download(str(destination), checksum=None)
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _mock_response(chunks=chunks)
+
+        with mock.patch.object(
+            download_mod.FileDownload,
+            "_write_chunk",
+            side_effect=KeyboardInterrupt,
+        ):
+            with pytest.raises(KeyboardInterrupt):
+                download.consume(transport)
+
+        # The old snapshot is untouched and still readable.
+        assert destination.read_bytes() == old_snapshot
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    def test_consume_unwritable_directory(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        download = self._make_download(str(destination))
+        transport = mock.Mock(spec=["request"])
+
+        with mock.patch.object(
+            download_mod.tempfile,
+            "mkstemp",
+            side_effect=OSError(13, "Permission denied"),
+        ):
+            with pytest.raises(common.LocalWriteError) as exc_info:
+                download.consume(transport)
+
+        assert isinstance(exc_info.value, OSError)
+        assert exc_info.value.path == os.path.dirname(str(destination))
+        assert not transport.request.called
+
+        # The old snapshot is untouched and still readable.
+        assert destination.read_bytes() == old_snapshot
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    def test_consume_staging_file_hidden_while_downloading(self, tmp_path):
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(b"old snapshot")
+
+        chunks = (b"first segment, ", b"final segment")
+        seen = {}
+
+        real_write_chunk = download_mod.FileDownload._write_chunk
+
+        def spy_write_chunk(self, chunk):
+            seen.setdefault("names", set(os.listdir(str(tmp_path))))
+            return real_write_chunk(self, chunk)
+
+        download = self._make_download(str(destination), checksum=None)
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _mock_response(chunks=chunks)
+
+        with mock.patch.object(
+            download_mod.FileDownload, "_write_chunk", spy_write_chunk
+        ):
+            download.consume(transport)
+
+        # While downloading, the destination path still held the old bytes
+        # and the staging file used a hidden, unpublished name.
+        (staging_name,) = seen["names"] - {"data.bin"}
+        assert staging_name.startswith(download_mod._STAGING_FILE_PREFIX)
+        assert staging_name.endswith(".part")
+        assert destination.read_bytes() == b"".join(chunks)
+
+    def test_verify_staging_file_partial_response_mismatch(self, tmp_path):
+        # When a transfer resumes, the final response may be a 206 and
+        # ``_write_to_stream`` skips its per-response check. The staging
+        # file must still be verified as a whole before publication.
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(b"old snapshot")
+        staging = tmp_path / ".staging.part"
+        staging.write_bytes(b"corrupt assembled bytes")
+
+        download = self._make_download(str(destination))
+        download.staging_path = str(staging)
+        download._expected_checksum = "AAAAAAAAAAAAAAAAAAAAAA=="
+        download._checksum_object = hashlib.md5()
+
+        response = _mock_response(
+            status_code=http.client.PARTIAL_CONTENT,
+            headers={},
+        )
+        with pytest.raises(common.ChecksumMismatchError):
+            download._verify_staging_file(response)
+
+        assert destination.read_bytes() == b"old snapshot"
+
+    def test_verify_staging_file_missing_expected_checksum(self, tmp_path):
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(b"old snapshot")
+        staging = tmp_path / ".staging.part"
+        staging.write_bytes(b"assembled bytes")
+
+        download = self._make_download(str(destination))
+        download.staging_path = str(staging)
+        download._expected_checksum = None
+        download._checksum_object = hashlib.md5()
+
+        response = _mock_response(
+            status_code=http.client.PARTIAL_CONTENT,
+            headers={},
+        )
+        with pytest.raises(common.MissingChecksum):
+            download._verify_staging_file(response)
+
+    def test_verify_staging_file_skipped_for_ranges(self, tmp_path):
+        download = self._make_download(
+            str(tmp_path / "data.bin"), start=0, end=9
+        )
+        download.staging_path = str(tmp_path / ".staging.part")
+        download._expected_checksum = "AAAAAAAAAAAAAAAAAAAAAA=="
+        download._checksum_object = hashlib.md5()
+
+        response = _mock_response(
+            status_code=http.client.PARTIAL_CONTENT,
+            headers={},
+        )
+        # No exception: whole-object checksums do not describe ranges.
+        assert download._verify_staging_file(response) is None
+
+    def test_download_to_file_function(self, tmp_path):
+        destination = tmp_path / "data.bin"
+        chunks = (b"first segment, ", b"final segment")
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _mock_response(chunks=chunks)
+
+        response = download_mod.download_to_file(
+            EXAMPLE_URL, str(destination), transport, checksum=None
+        )
+
+        assert response is transport.request.return_value
+        assert destination.read_bytes() == b"".join(chunks)
+
+    def test_download_to_file_function_transport_first(self, tmp_path):
+        destination = tmp_path / "data.bin"
+        chunks = (b"first segment, ", b"final segment")
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _mock_response(chunks=chunks)
+
+        download_mod.download_to_file(
+            transport, EXAMPLE_URL, str(destination), checksum=None
+        )
+
+        assert destination.read_bytes() == b"".join(chunks)
+
+    def test_consume_publish_failure_keeps_old_snapshot(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        chunks = (b"first segment, ", b"final segment")
+        download = self._make_download(str(destination), checksum=None)
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _mock_response(chunks=chunks)
+
+        with mock.patch.object(
+            download_mod.os,
+            "replace",
+            side_effect=OSError(18, "Invalid cross-device link"),
+        ):
+            with pytest.raises(common.LocalWriteError) as exc_info:
+                download.consume(transport)
+
+        assert isinstance(exc_info.value, OSError)
+        # The old snapshot is untouched and the staging file is discarded.
+        assert destination.read_bytes() == old_snapshot
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    def test_destination_can_be_pathlike(self, tmp_path):
+        destination = tmp_path / "data.bin"
+        chunks = (b"first segment, ", b"final segment")
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _mock_response(chunks=chunks)
+
+        self._consume(
+            self._make_download(destination, checksum=None), chunks, headers={}
+        )
+
+        assert destination.read_bytes() == b"".join(chunks)
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    def test_raw_file_download_publishes_verified_file(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        chunks = (b"first segment, ", b"final segment")
+        expected_md5 = hashlib.md5(b"".join(chunks)).digest()
+        headers = {
+            _helpers._HASH_HEADER: "md5={}".format(
+                base64.b64encode(expected_md5).decode("utf-8")
+            )
+        }
+
+        download = download_mod.RawFileDownload(str(EXAMPLE_URL), str(destination))
+        transport = mock.Mock(spec=["request"])
+        transport.request.return_value = _mock_raw_response(
+            chunks=chunks, headers=headers
+        )
+        download.consume(transport)
+
+        assert destination.read_bytes() == b"".join(chunks)
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
 
 
 class Test__add_decoder(object):

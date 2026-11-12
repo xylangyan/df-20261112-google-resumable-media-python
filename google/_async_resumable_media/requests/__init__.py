@@ -664,9 +664,14 @@ transmitted in chunks until completion:
 """
 from google._async_resumable_media.requests.download import ChunkedDownload
 from google._async_resumable_media.requests.download import Download
+from google._async_resumable_media.requests.download import download_to_file
+from google._async_resumable_media.requests.download import DownloadToFile
+from google._async_resumable_media.requests.download import FileDownload
 from google._async_resumable_media.requests.upload import MultipartUpload
 from google._async_resumable_media.requests.download import RawChunkedDownload
 from google._async_resumable_media.requests.download import RawDownload
+from google._async_resumable_media.requests.download import RawDownloadToFile
+from google._async_resumable_media.requests.download import RawFileDownload
 from google._async_resumable_media.requests.upload import ResumableUpload
 from google._async_resumable_media.requests.upload import SimpleUpload
 
@@ -674,9 +679,14 @@ from google._async_resumable_media.requests.upload import SimpleUpload
 __all__ = [
     "ChunkedDownload",
     "Download",
+    "download_to_file",
+    "DownloadToFile",
+    "FileDownload",
     "MultipartUpload",
     "RawChunkedDownload",
     "RawDownload",
+    "RawDownloadToFile",
+    "RawFileDownload",
     "ResumableUpload",
     "SimpleUpload",
 ]

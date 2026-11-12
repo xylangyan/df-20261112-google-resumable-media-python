@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import hashlib
 import http.client
 import io
+import os
 
 import aiohttp  # type: ignore
 import mock
@@ -784,6 +787,125 @@ class AsyncIter:
     async def __aiter__(self):
         for item in self.items:
             yield item
+
+
+class TestFileDownload(object):
+    """Async counterpart of the sync ``TestFileDownload`` scenarios."""
+
+    def _make_download(self, destination, checksum="md5"):
+        return download_mod.FileDownload(
+            sync_test.EXAMPLE_URL, destination, checksum=checksum
+        )
+
+    def _transport(self, chunks, headers=None):
+        transport = mock.AsyncMock(spec=["request"])
+        transport.request = mock.AsyncMock(
+            spec=["__call__"],
+            return_value=_mock_response(chunks=chunks, headers=headers),
+        )
+        return transport
+
+    @pytest.mark.asyncio
+    async def test_aliases(self):
+        assert download_mod.DownloadToFile is download_mod.FileDownload
+        assert download_mod.RawDownloadToFile is download_mod.RawFileDownload
+
+    @pytest.mark.asyncio
+    async def test_consume_publishes_verified_file(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        chunks = (b"first segment, ", b"second segment, ", b"final segment")
+        payload = b"".join(chunks)
+        md5 = base64.b64encode(hashlib.md5(payload).digest()).decode("utf-8")
+        headers = {_helpers._HASH_HEADER: "md5={}".format(md5)}
+
+        download = self._make_download(str(destination))
+        await download.consume(self._transport(chunks, headers))
+
+        assert download.finished
+        assert download._published
+        assert download.staging_path is None
+        assert destination.read_bytes() == payload
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    @pytest.mark.asyncio
+    async def test_consume_final_segment_corrupt_keeps_old_snapshot(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        good_chunks = (b"first segment, ", b"second segment, ", b"final segment")
+        corrupt_chunks = good_chunks[:-1] + (b"final segmenX",)
+        expected_md5 = base64.b64encode(
+            hashlib.md5(b"".join(good_chunks)).digest()
+        ).decode("utf-8")
+        headers = {_helpers._HASH_HEADER: "md5={}".format(expected_md5)}
+
+        download = self._make_download(str(destination))
+        with pytest.raises(common.ChecksumMismatchError):
+            await download.consume(self._transport(corrupt_chunks, headers))
+
+        assert destination.read_bytes() == old_snapshot
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+        assert not download._published
+
+    @pytest.mark.asyncio
+    async def test_consume_missing_expected_checksum(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        chunks = (b"first segment, ", b"final segment")
+        download = self._make_download(str(destination))
+        with pytest.raises(common.MissingChecksum):
+            await download.consume(self._transport(chunks, {}))
+
+        assert destination.read_bytes() == old_snapshot
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    @pytest.mark.asyncio
+    async def test_consume_local_write_error(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        chunks = (b"first segment, ", b"final segment")
+        download = self._make_download(str(destination), checksum=None)
+
+        with mock.patch.object(
+            download_mod.FileDownload,
+            "_write_chunk",
+            side_effect=common.LocalWriteError(
+                OSError(28, "No space left on device")
+            ),
+        ):
+            with pytest.raises(common.LocalWriteError):
+                await download.consume(self._transport(chunks))
+
+        assert destination.read_bytes() == old_snapshot
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
+
+    @pytest.mark.asyncio
+    async def test_consume_cancellation_keeps_old_snapshot(self, tmp_path):
+        old_snapshot = b"old snapshot, previous generation"
+        destination = tmp_path / "data.bin"
+        destination.write_bytes(old_snapshot)
+
+        chunks = (b"first segment, ", b"final segment")
+        download = self._make_download(str(destination), checksum=None)
+
+        with mock.patch.object(
+            download_mod.FileDownload,
+            "_write_chunk",
+            side_effect=KeyboardInterrupt,
+        ):
+            with pytest.raises(KeyboardInterrupt):
+                await download.consume(self._transport(chunks))
+
+        assert destination.read_bytes() == old_snapshot
+        assert sorted(os.listdir(str(tmp_path))) == ["data.bin"]
 
 
 def _mock_response(status=http.client.OK, chunks=(), headers=None):

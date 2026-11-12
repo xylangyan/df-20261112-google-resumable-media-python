@@ -110,6 +110,57 @@ class DataCorruption(Exception):
         """object: The HTTP response object that caused the failure."""
 
 
+class ChecksumMismatchError(DataCorruption):
+    """Error class when the downloaded checksum disagrees with the source.
+
+    This is a specialized :class:`DataCorruption` used by the local file
+    download entry point, which refuses to publish a file whose checksum
+    does not match the checksum advertised by the source service.
+    """
+
+
+class MissingChecksum(InvalidResponse):
+    """Error class when the source provides no checksum to verify against.
+
+    Raised by the local file download entry point when a checksum was
+    requested but the response headers do not contain the corresponding
+    expected value. Publishing unverified bytes to the destination path is
+    not allowed, so the transfer fails instead of silently skipping
+    validation.
+    """
+
+    def __init__(self, response, *args):
+        super(MissingChecksum, self).__init__(response, *args)
+
+
+class LocalWriteError(OSError):
+    """Error class for failures while writing to local storage.
+
+    Wraps an :class:`OSError` raised while creating, writing, syncing or
+    moving the unpublished staging file. Since it is an :class:`OSError`,
+    callers can keep handling plain file-system errors as before while
+    still being able to distinguish them from checksum failures.
+
+    Args:
+        error (OSError): The original file-system error.
+        path (Optional[str]): The local path involved in the failure.
+    """
+
+    def __init__(self, error, path=None):
+        super(LocalWriteError, self).__init__(error.errno or 0, str(error))
+        self.__cause__ = error
+        self.error = error
+        """OSError: The original file-system error."""
+        self.path = path
+        """Optional[str]: The local path involved in the failure."""
+
+
+# Naming aliases: ``*Error`` and ``*Failure`` variants are both common.
+ChecksumMismatch = ChecksumMismatchError
+MissingChecksumError = MissingChecksum
+LocalWriteFailure = LocalWriteError
+
+
 class RetryStrategy(object):
     """Configuration class for retrying failed requests.
 

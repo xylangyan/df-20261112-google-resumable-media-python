@@ -143,6 +143,10 @@ class Download(DownloadBase):
         self._expected_checksum = None
         self._checksum_object = None
         self._object_generation = None
+        # When ``True`` (the local file download entry point) a missing
+        # source checksum is an error rather than an info-level log, and
+        # local file-system errors are wrapped in a dedicated exception.
+        self._require_checksum = False
 
     def _prepare_request(self):
         """Prepare the contents of an HTTP request.

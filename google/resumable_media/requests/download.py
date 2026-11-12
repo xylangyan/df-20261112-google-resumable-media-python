@@ -14,6 +14,9 @@
 
 """Support for downloading media from Google APIs."""
 
+import os
+import tempfile
+
 import urllib3.response  # type: ignore
 import http
 
@@ -36,6 +39,16 @@ but the actual {checksum_type} checksum of the downloaded contents was:
 
   {}
 """
+
+_MISSING_CHECKSUM = """\
+No {checksum_type} checksum was returned from the service while downloading {}
+
+The local file download entry point refuses to publish a file whose
+integrity cannot be verified against the source, so the transfer failed
+and the destination path was left untouched.
+"""
+
+_STAGING_FILE_PREFIX = ".tmp-resumable-media-"
 
 _STREAM_SEEK_ERROR = """\
 Incomplete download for:
@@ -119,6 +132,16 @@ class Download(_request_helpers.RequestsMixin, _download.Download):
             expected_checksum = self._expected_checksum
             checksum_object = self._checksum_object
 
+        if (
+            self._require_checksum
+            and expected_checksum is None
+            and response.status_code != http.client.PARTIAL_CONTENT
+        ):
+            msg = _MISSING_CHECKSUM.format(
+                self.media_url, checksum_type=self.checksum.upper()
+            )
+            raise common.MissingChecksum(response, msg)
+
         with response:
             # NOTE: In order to handle compressed streams gracefully, we try
             # to insert our checksum object into the decompression stream. If
@@ -129,8 +152,7 @@ class Download(_request_helpers.RequestsMixin, _download.Download):
                 chunk_size=_request_helpers._SINGLE_GET_CHUNK_SIZE, decode_unicode=False
             )
             for chunk in body_iter:
-                self._stream.write(chunk)
-                self._bytes_downloaded += len(chunk)
+                self._write_chunk(chunk)
                 local_checksum_object.update(chunk)
 
         # Don't validate the checksum for partial responses.
@@ -164,7 +186,20 @@ class Download(_request_helpers.RequestsMixin, _download.Download):
                         checksum_type=self.checksum.upper(),
                     )
                     msg += content_length_msg
-                    raise common.DataCorruption(response, msg)
+                    raise self._checksum_mismatch_error(response, msg)
+
+    def _write_chunk(self, chunk):
+        """Write one chunk to the stream, counting the bytes.
+
+        Local file downloads override this to turn file-system failures
+        into :class:`~google.resumable_media.common.LocalWriteError`.
+        """
+        self._stream.write(chunk)
+        self._bytes_downloaded += len(chunk)
+
+    def _checksum_mismatch_error(self, response, message):
+        """Build the exception raised when the checksum does not match."""
+        return common.DataCorruption(response, message)
 
     def consume(
         self,
@@ -329,13 +364,22 @@ class RawDownload(_request_helpers.RawRequestsMixin, _download.Download):
             expected_checksum = self._expected_checksum
             checksum_object = self._checksum_object
 
+        if (
+            self._require_checksum
+            and expected_checksum is None
+            and response.status_code != http.client.PARTIAL_CONTENT
+        ):
+            msg = _MISSING_CHECKSUM.format(
+                self.media_url, checksum_type=self.checksum.upper()
+            )
+            raise common.MissingChecksum(response, msg)
+
         with response:
             body_iter = response.raw.stream(
                 _request_helpers._SINGLE_GET_CHUNK_SIZE, decode_content=False
             )
             for chunk in body_iter:
-                self._stream.write(chunk)
-                self._bytes_downloaded += len(chunk)
+                self._write_chunk(chunk)
                 checksum_object.update(chunk)
             response._content_consumed = True
 
@@ -370,7 +414,16 @@ class RawDownload(_request_helpers.RawRequestsMixin, _download.Download):
                         checksum_type=self.checksum.upper(),
                     )
                     msg += content_length_msg
-                    raise common.DataCorruption(response, msg)
+                    raise self._checksum_mismatch_error(response, msg)
+
+    def _write_chunk(self, chunk):
+        """Write one chunk to the stream, counting the bytes."""
+        self._stream.write(chunk)
+        self._bytes_downloaded += len(chunk)
+
+    def _checksum_mismatch_error(self, response, message):
+        """Build the exception raised when the checksum does not match."""
+        return common.DataCorruption(response, message)
 
     def consume(
         self,
@@ -468,6 +521,372 @@ class RawDownload(_request_helpers.RawRequestsMixin, _download.Download):
         return _request_helpers.wait_and_retry(
             retriable_request, self._get_status_code, self._retry_strategy
         )
+
+
+class FileDownload(Download):
+    """Download a resource into a local file, publishing it atomically.
+
+    This is the local-file entry point: a downstream parser only ever
+    looks at the fixed ``destination`` path, so the file must not appear
+    there (or be modified) until the whole resource has been received and
+    its checksum agrees with the value advertised by the source.
+
+    Bytes are written to an unpublished staging file next to
+    ``destination`` (same directory, unique hidden name). Only after the
+    response is complete, every segment is present and the checksum
+    matches is the staging file moved onto ``destination`` with
+    :func:`os.replace`. If anything fails - cancellation, a checksum
+    mismatch, a missing expected checksum, or a local write problem - the
+    staging file is removed and ``destination`` is left exactly as it was,
+    so a previous-generation snapshot remains readable.
+
+    In contrast to the stream-based :class:`Download` / :class:`RawDownload`
+    interfaces, this entry point does **not** expose partial bytes at
+    ``destination`` while downloading. That "read while downloading"
+    behavior remains available by passing an explicit ``stream`` to the
+    older APIs.
+
+    Args:
+        media_url (str): The URL containing the media to be downloaded.
+        destination (str): The local path of the published file. It may
+            already exist (e.g. a snapshot from a previous run); it is only
+            replaced once the new download has been fully verified.
+        start (int): The first byte in a range to be downloaded. If not
+            provided, but ``end`` is provided, will download from the
+            beginning to ``end`` of the media.
+        end (int): The last byte in a range to be downloaded. If not
+            provided, but ``start`` is provided, will download from the
+            ``start`` to the end of the media.
+        headers (Optional[Mapping[str, str]]): Extra headers that should
+            be sent with the request, e.g. headers for encrypted data.
+        checksum Optional([str]): The type of checksum to compute to verify
+            the integrity of the object. Unlike :class:`Download`, a missing
+            expected checksum is an error for this entry point: unverified
+            bytes are never published. Supported values are "md5", "crc32c"
+            and None. When ``None`` is passed, no checksum is required and
+            the "missing expected checksum" error cannot occur, but the
+            caller explicitly opts out of integrity verification.
+
+    Attributes:
+        destination (str): The local path the verified file is published to.
+        staging_path (Optional[str]): The unpublished path currently being
+            written, or :data:`None` when no download is in progress.
+    """
+
+    def __init__(
+        self,
+        media_url,
+        destination,
+        start=None,
+        end=None,
+        headers=None,
+        checksum="md5",
+    ):
+        super(FileDownload, self).__init__(
+            media_url,
+            stream=None,
+            start=start,
+            end=end,
+            headers=headers,
+            checksum=checksum,
+        )
+        self.destination = destination
+        self.staging_path = None
+        self._require_checksum = checksum is not None
+        self._published = False
+
+    def _checksum_mismatch_error(self, response, message):
+        """Build a checksum-specific error for the local file entry point."""
+        return common.ChecksumMismatchError(response, message)
+
+    def _write_chunk(self, chunk):
+        """Write one chunk to the staging file.
+
+        Raises:
+            ~google.resumable_media.common.LocalWriteError: If the bytes
+                could not be written to the staging file.
+        """
+        try:
+            self._stream.write(chunk)
+        except OSError as exc:
+            raise common.LocalWriteError(exc, path=self.staging_path) from exc
+        self._bytes_downloaded += len(chunk)
+
+    def _open_staging_file(self):
+        """Create the unpublished staging file next to ``destination``."""
+        directory = os.path.dirname(os.path.abspath(self.destination))
+        file_desc = None
+        try:
+            file_desc, self.staging_path = tempfile.mkstemp(
+                prefix=_STAGING_FILE_PREFIX,
+                suffix=".part",
+                dir=directory,
+            )
+            return os.fdopen(file_desc, "wb")
+        except OSError as exc:
+            if file_desc is not None:
+                try:
+                    os.close(file_desc)
+                except OSError:
+                    pass
+            self._discard_staging_file()
+            raise common.LocalWriteError(exc, path=directory) from exc
+
+    def _publish(self):
+        """Move the verified staging file onto ``destination`` atomically."""
+        # ``os.replace`` is atomic on POSIX and replaces an existing file
+        # on Windows as well, so readers at ``destination`` see either the
+        # previous snapshot or the fully verified new file, never a mix.
+        try:
+            os.replace(self.staging_path, self.destination)
+            self._published = True
+        except OSError as exc:
+            raise common.LocalWriteError(exc, path=self.destination) from exc
+
+    def _verify_staging_file(self, response):
+        """Final gate: verify the assembled bytes before publishing.
+
+        The checksum object is updated for every byte written, including
+        bytes received by range requests after an interrupted transfer. A
+        retried transfer ends with a 206 response, for which
+        :meth:`Download._write_to_stream` deliberately skips its own
+        validation; this method performs the whole-file comparison instead.
+        """
+        if not self._require_checksum:
+            return
+        if self._expected_checksum is None:
+            msg = _MISSING_CHECKSUM.format(
+                self.media_url, checksum_type=self.checksum.upper()
+            )
+            raise common.MissingChecksum(response, msg)
+        if self.start is not None or self.end is not None:
+            # A whole-object checksum does not describe a byte range.
+            return
+
+        actual_checksum = _helpers.prepare_checksum_digest(
+            self._checksum_object.digest()
+        )
+        if actual_checksum != self._expected_checksum:
+            msg = _CHECKSUM_MISMATCH.format(
+                self.media_url,
+                self._expected_checksum,
+                actual_checksum,
+                checksum_type=self.checksum.upper(),
+            )
+            raise common.ChecksumMismatchError(response, msg)
+
+    def _discard_staging_file(self):
+        """Remove the unpublished staging file, if any."""
+        staging_path = self.staging_path
+        self.staging_path = None
+        if staging_path is None:
+            return
+        try:
+            os.remove(staging_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Cancellation / error paths must not mask the original error;
+            # leaving an unpublished staging file behind is safe because
+            # ``destination`` was never touched.
+            pass
+
+    def _consume_and_publish(self, do_consume):
+        """Run ``do_consume`` against a staging file, then publish it."""
+        stream = self._open_staging_file()
+        self._stream = stream
+        close_error = None
+        try:
+            result = do_consume()
+            try:
+                stream.flush()
+            except OSError as exc:
+                raise common.LocalWriteError(exc, path=self.staging_path)
+        except BaseException:
+            # Cancellation (e.g. KeyboardInterrupt) and verification errors
+            # both land here: never publish, and leave ``destination``
+            # (possibly an older snapshot) untouched.
+            self._stream = None
+            try:
+                stream.close()
+            except OSError:
+                pass
+            self._discard_staging_file()
+            raise
+
+        self._stream = None
+        try:
+            stream.close()
+        except OSError as exc:
+            close_error = exc
+
+        if close_error is not None:
+            self._discard_staging_file()
+            raise common.LocalWriteError(close_error, path=self.staging_path)
+
+        try:
+            self._verify_staging_file(result)
+            self._publish()
+        except BaseException:
+            self._discard_staging_file()
+            raise
+        self.staging_path = None
+        return result
+
+    def consume(
+        self,
+        transport,
+        timeout=(
+            _request_helpers._DEFAULT_CONNECT_TIMEOUT,
+            _request_helpers._DEFAULT_READ_TIMEOUT,
+        ),
+    ):
+        """Download the resource and publish it at ``destination``.
+
+        Args:
+            transport (~requests.Session): A ``requests`` object which can
+                make authenticated requests.
+            timeout (Optional[Union[float, Tuple[float, float]]]):
+                The number of seconds to wait for the server response.
+                Depending on the retry strategy, a request may be repeated
+                several times using the same timeout each time.
+
+                Can also be passed as a tuple (connect_timeout, read_timeout).
+                See :meth:`requests.Session.request` documentation for details.
+
+        Returns:
+            ~requests.Response: The HTTP response returned by ``transport``.
+
+        Raises:
+            ~google.resumable_media.common.ChecksumMismatchError: If the
+                downloaded contents do not match the source checksum.
+            ~google.resumable_media.common.MissingChecksum: If the source
+                did not advertise the requested checksum type.
+            ~google.resumable_media.common.LocalWriteError: If the staging
+                file could not be written, moved or cleaned up.
+        """
+
+        def do_consume():
+            return super(FileDownload, self).consume(transport, timeout=timeout)
+
+        return self._consume_and_publish(do_consume)
+
+
+class RawFileDownload(RawDownload):
+    """Raw variant of :class:`FileDownload`.
+
+    Behaves identically to :class:`FileDownload` but uses the raw
+    transport (no response-body expansion), with the same staging-then-
+    publish guarantee and the same error distinctions.
+    """
+
+    def __init__(
+        self,
+        media_url,
+        destination,
+        start=None,
+        end=None,
+        headers=None,
+        checksum="md5",
+    ):
+        super(RawFileDownload, self).__init__(
+            media_url,
+            stream=None,
+            start=start,
+            end=end,
+            headers=headers,
+            checksum=checksum,
+        )
+        self.destination = destination
+        self.staging_path = None
+        self._require_checksum = checksum is not None
+        self._published = False
+
+    _checksum_mismatch_error = FileDownload._checksum_mismatch_error
+    _write_chunk = FileDownload._write_chunk
+    _open_staging_file = FileDownload._open_staging_file
+    _publish = FileDownload._publish
+    _discard_staging_file = FileDownload._discard_staging_file
+    _verify_staging_file = FileDownload._verify_staging_file
+    _consume_and_publish = FileDownload._consume_and_publish
+
+    def consume(
+        self,
+        transport,
+        timeout=(
+            _request_helpers._DEFAULT_CONNECT_TIMEOUT,
+            _request_helpers._DEFAULT_READ_TIMEOUT,
+        ),
+    ):
+        """Download the raw resource and publish it at ``destination``."""
+
+        def do_consume():
+            return super(RawFileDownload, self).consume(
+                transport, timeout=timeout
+            )
+
+        return self._consume_and_publish(do_consume)
+
+
+# Explicit, descriptive aliases for callers that think in terms of the
+# operation ("download to a file") rather than the class name.
+DownloadToFile = FileDownload
+RawDownloadToFile = RawFileDownload
+
+
+def download_to_file(
+    media_url,
+    destination,
+    transport,
+    start=None,
+    end=None,
+    headers=None,
+    checksum="md5",
+    timeout=(
+        _request_helpers._DEFAULT_CONNECT_TIMEOUT,
+        _request_helpers._DEFAULT_READ_TIMEOUT,
+    ),
+):
+    """Download a resource into ``destination`` with the publication guarantee.
+
+    Thin convenience wrapper around :class:`FileDownload`: bytes are staged
+    in an unpublished file next to ``destination`` and only moved into place
+    once all segments are present and the checksum matches the source.
+
+    Args:
+        media_url (str): The URL containing the media to be downloaded.
+        destination (str): The local path the verified file is published to.
+        transport (~requests.Session): A ``requests`` object which can
+            make authenticated requests.
+        start (int): The first byte in a range to be downloaded.
+        end (int): The last byte in a range to be downloaded.
+        headers (Optional[Mapping[str, str]]): Extra request headers.
+        checksum Optional([str]): The checksum type to verify; see
+            :class:`FileDownload`.
+        timeout (Optional[Union[float, Tuple[float, float]]]): The request
+            timeout(s).
+
+    Returns:
+        ~requests.Response: The HTTP response returned by ``transport``.
+    """
+    # Accept either ``download_to_file(url, path, transport)`` or the
+    # transport-first ``download_to_file(transport, url, path)`` form.
+    if (
+        not isinstance(media_url, str)
+        and isinstance(transport, str)
+        and hasattr(media_url, "request")
+    ):
+        media_url, destination, transport = destination, transport, media_url
+
+    download = FileDownload(
+        media_url,
+        destination,
+        start=start,
+        end=end,
+        headers=headers,
+        checksum=checksum,
+    )
+    return download.consume(transport, timeout=timeout)
 
 
 class ChunkedDownload(_request_helpers.RequestsMixin, _download.ChunkedDownload):
