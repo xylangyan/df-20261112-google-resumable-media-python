@@ -593,6 +593,189 @@ class TestChunkedDownload(object):
         assert download.bytes_downloaded == 0
         assert download.total_bytes is None
 
+    def test_constructor_pin_version_defaults(self):
+        download = _download.ChunkedDownload(EXAMPLE_URL, 256, None)
+        assert not download.pin_version
+        assert download.expected_version is None
+
+    def test_constructor_pin_version_explicit(self):
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL, 256, None, pin_version=True, version='"v1"'
+        )
+        assert download.pin_version
+        assert download.expected_version == '"v1"'
+
+    def test_constructor_version_implies_pin_version(self):
+        download = _download.ChunkedDownload(EXAMPLE_URL, 256, None, version='"v1"')
+        assert download.pin_version
+        assert download.expected_version == '"v1"'
+
+    def test__prepare_request_with_known_version(self):
+        chunk_size = 2048
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL, chunk_size, None, version='"v1"'
+        )
+        method, url, payload, headers = download._prepare_request()
+        assert method == "GET"
+        assert url == EXAMPLE_URL
+        assert payload is None
+        assert headers == {"range": "bytes=0-2047", "if-match": '"v1"'}
+
+    def test__prepare_request_without_known_version(self):
+        chunk_size = 2048
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL, chunk_size, None, pin_version=True
+        )
+        _, _, _, headers = download._prepare_request()
+        # No version known yet, so no conditional header is added.
+        assert headers == {"range": "bytes=0-2047"}
+
+    def test__prepare_request_caller_supplied_condition(self):
+        chunk_size = 2048
+        headers = {"if-match": '"caller-v9"'}
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL, chunk_size, None, headers=headers, pin_version=True
+        )
+        _, _, _, new_headers = download._prepare_request()
+        # The caller's own conditional header is honored and adopted.
+        assert new_headers is headers
+        assert headers == {"if-match": '"caller-v9"', "range": "bytes=0-2047"}
+        assert download.expected_version == '"caller-v9"'
+
+    def test__prepare_request_caller_supplied_condition_not_overwritten(self):
+        chunk_size = 2048
+        headers = {"If-Match": '"caller-v9"'}
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL,
+            chunk_size,
+            None,
+            headers=headers,
+            pin_version=True,
+            version='"v1"',
+        )
+        _, _, _, new_headers = download._prepare_request()
+        assert new_headers is headers
+        assert headers == {"If-Match": '"caller-v9"', "range": "bytes=0-2047"}
+        assert download.expected_version == '"v1"'
+
+    def test__process_response_pins_version(self):
+        data = b"pin me"
+        chunk_size = len(data)
+        stream = io.BytesIO()
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL, chunk_size, stream, pin_version=True
+        )
+        _fix_up_virtual(download)
+
+        total_bytes = 2 * chunk_size
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        response.headers["etag"] = '"v1"'
+        download._process_response(response)
+        assert download.expected_version == '"v1"'
+        assert download.bytes_downloaded == chunk_size
+        assert stream.getvalue() == data
+        # The next request carries the pinned version as a condition.
+        _, _, _, headers = download._prepare_request()
+        assert headers["if-match"] == '"v1"'
+
+    def test__process_response_version_changed(self):
+        data = b"same-length-chunk"
+        chunk_size = len(data)
+        stream = io.BytesIO()
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL, chunk_size, stream, pin_version=True
+        )
+        _fix_up_virtual(download)
+
+        total_bytes = 2 * chunk_size
+        first = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        first.headers["etag"] = '"v1"'
+        download._process_response(first)
+        assert stream.getvalue() == data
+
+        # Same length, different version identifier.
+        second = self._mock_response(
+            chunk_size,
+            total_bytes - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        second.headers["etag"] = '"v2"'
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download._process_response(second)
+
+        error = exc_info.value
+        assert error.response is second
+        # The second chunk was rejected before writing: the stream keeps
+        # only the accepted prefix and progress stops there.
+        assert stream.getvalue() == data
+        assert download.bytes_downloaded == chunk_size
+        assert download.invalid
+        assert not download.finished
+
+    def test__process_response_version_missing(self):
+        data = b"no version here"
+        chunk_size = len(data)
+        stream = io.BytesIO()
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL, chunk_size, stream, pin_version=True
+        )
+        _fix_up_virtual(download)
+
+        total_bytes = chunk_size
+        response = self._mock_response(
+            0,
+            chunk_size - 1,
+            total_bytes,
+            content=data,
+            status_code=int(http.client.PARTIAL_CONTENT),
+        )
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download._process_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert stream.getvalue() == b""
+        assert download.bytes_downloaded == 0
+        assert download.invalid
+
+    def test__process_response_precondition_failed(self):
+        stream = io.BytesIO()
+        stream.write(b"accepted prefix")
+        download = _download.ChunkedDownload(
+            EXAMPLE_URL, 256, stream, pin_version=True, version='"v1"'
+        )
+        _fix_up_virtual(download)
+        download._bytes_downloaded = len(b"accepted prefix")
+
+        response = mock.Mock(
+            status_code=int(http.client.PRECONDITION_FAILED),
+            spec=["status_code"],
+        )
+        with pytest.raises(common.InvalidResponse) as exc_info:
+            download._process_response(response)
+
+        error = exc_info.value
+        assert error.response is response
+        assert error.args[1] == http.client.PRECONDITION_FAILED
+        # Only the accepted prefix remains and progress is frozen.
+        assert stream.getvalue() == b"accepted prefix"
+        assert download.bytes_downloaded == len(b"accepted prefix")
+        assert download.invalid
+
     def test_consume_next_chunk(self):
         download = _download.ChunkedDownload(EXAMPLE_URL, 256, None)
         with pytest.raises(NotImplementedError) as exc_info:

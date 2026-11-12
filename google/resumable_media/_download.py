@@ -29,6 +29,8 @@ _CONTENT_RANGE_RE = re.compile(
 _ACCEPTABLE_STATUS_CODES = (http.client.OK, http.client.PARTIAL_CONTENT)
 _GET = "GET"
 _ZERO_CONTENT_RANGE_HEADER = "bytes */0"
+_VERSION_HEADER = "etag"
+_VERSION_CONDITION_HEADER = "if-match"
 
 
 class DownloadBase(object):
@@ -229,6 +231,19 @@ class ChunkedDownload(DownloadBase):
         headers (Optional[Mapping[str, str]]): Extra headers that should
             be sent with each request, e.g. headers for data encryption
             key headers.
+        pin_version (Optional[bool]): When :data:`True`, the download is
+            pinned to a single object version. The version (taken from the
+            ``etag`` response header) is captured from the first chunk and
+            enforced on every later chunk: an ``if-match`` conditional
+            header is added to each follow-up request and the version in
+            each response is verified **before** its bytes are written to
+            the stream. If the version header is missing, changes, or the
+            server rejects the conditional request, the download becomes
+            invalid and only the already-accepted prefix stays in the
+            stream. Defaults to :data:`False`.
+        version (Optional[str]): A known version (the value of an
+            ``etag`` header) to pin the download to. Passing a value
+            implies ``pin_version=True``.
 
     Attributes:
         media_url (str): The URL containing the media to be downloaded.
@@ -240,7 +255,17 @@ class ChunkedDownload(DownloadBase):
         ValueError: If ``start`` is negative.
     """
 
-    def __init__(self, media_url, chunk_size, stream, start=0, end=None, headers=None):
+    def __init__(
+        self,
+        media_url,
+        chunk_size,
+        stream,
+        start=0,
+        end=None,
+        headers=None,
+        pin_version=False,
+        version=None,
+    ):
         if start < 0:
             raise ValueError(
                 "On a chunked download the starting " "value cannot be negative."
@@ -252,6 +277,8 @@ class ChunkedDownload(DownloadBase):
         self._bytes_downloaded = 0
         self._total_bytes = None
         self._invalid = False
+        self._pin_version = pin_version or version is not None
+        self._expected_version = version
 
     @property
     def bytes_downloaded(self):
@@ -270,6 +297,21 @@ class ChunkedDownload(DownloadBase):
         This will occur if a call to :meth:`consume_next_chunk` fails.
         """
         return self._invalid
+
+    @property
+    def pin_version(self):
+        """bool: Indicates if the download is pinned to one object version."""
+        return self._pin_version
+
+    @property
+    def expected_version(self):
+        """Optional[str]: The version this download is pinned to.
+
+        This is either the ``version`` provided to the constructor, the
+        version captured from the first accepted response, or
+        :data:`None` if the version has not been determined yet.
+        """
+        return self._expected_version
 
     def _get_byte_range(self):
         """Determines the byte range for the next request.
@@ -320,9 +362,28 @@ class ChunkedDownload(DownloadBase):
         if self.invalid:
             raise ValueError("Download is invalid and cannot be re-used.")
 
+        if self._pin_version:
+            self._apply_version_condition()
+
         curr_start, curr_end = self._get_byte_range()
         add_bytes_range(curr_start, curr_end, self._headers)
         return _GET, self.media_url, None, self._headers
+
+    def _apply_version_condition(self):
+        """Make sure the request carries the pinned version condition.
+
+        A conditional header supplied by the caller is always honored and
+        adopted as the expected version. Otherwise, once the version is
+        known (from the constructor or a previous response), an
+        ``if-match`` header is added to the request headers.
+        """
+        condition = _get_header_value(self._headers, _VERSION_CONDITION_HEADER)
+        if self._expected_version is None:
+            if condition is not None:
+                # The caller supplied their own conditional header.
+                self._expected_version = condition
+        elif condition is None:
+            self._headers[_VERSION_CONDITION_HEADER] = self._expected_version
 
     def _make_invalid(self):
         """Simple setter for ``invalid``.
@@ -332,6 +393,47 @@ class ChunkedDownload(DownloadBase):
         raising.
         """
         self._invalid = True
+
+    def _update_version(self, response):
+        """Pin or verify the object version reported by a response.
+
+        The first response determines the version (unless one was already
+        provided via the constructor or a caller-supplied conditional
+        header). Every subsequent response must report the same version,
+        otherwise the download is marked invalid and an exception is
+        raised **before** any bytes are written to the stream, so the
+        stream keeps only the already-accepted prefix.
+
+        Args:
+            response (object): The HTTP response object.
+
+        Raises:
+            ~google.resumable_media.common.InvalidResponse: If the
+                response carries no version identifier, or its version
+                differs from the pinned one.
+        """
+        headers = self._get_headers(response)
+        version = _get_header_value(headers, _VERSION_HEADER)
+        if self._expected_version is None:
+            if version is None:
+                self._make_invalid()
+                raise common.InvalidResponse(
+                    response,
+                    "Response is missing a version identifier",
+                    "Expected header",
+                    _VERSION_HEADER,
+                )
+            self._expected_version = version
+        elif version != self._expected_version:
+            self._make_invalid()
+            raise common.InvalidResponse(
+                response,
+                "Object version changed during download",
+                "Expected",
+                self._expected_version,
+                "Received",
+                version,
+            )
 
     def _process_response(self, response):
         """Process the response from an HTTP request.
@@ -379,6 +481,13 @@ class ChunkedDownload(DownloadBase):
             self._get_status_code,
             callback=self._make_invalid,
         )
+
+        if self._pin_version:
+            # Verify the version before any bytes of this response can be
+            # written, so a changed/missing version leaves the stream with
+            # only the previously accepted prefix.
+            self._update_version(response)
+
         headers = self._get_headers(response)
         response_body = self._get_body(response)
 
@@ -441,6 +550,25 @@ class ChunkedDownload(DownloadBase):
             NotImplementedError: Always, since virtual.
         """
         raise NotImplementedError("This implementation is virtual.")
+
+
+def _get_header_value(headers, name):
+    """Look up a header value using a case-insensitive name match.
+
+    This works for plain ``dict`` headers as well as case-insensitive
+    header mappings.
+
+    Args:
+        headers (Mapping[str, str]): The headers to search.
+        name (str): The lower-cased header name to look for.
+
+    Returns:
+        Optional[str]: The header value, or :data:`None` if not present.
+    """
+    for header_name, value in headers.items():
+        if header_name.lower() == name:
+            return value
+    return None
 
 
 def add_bytes_range(start, end, headers):

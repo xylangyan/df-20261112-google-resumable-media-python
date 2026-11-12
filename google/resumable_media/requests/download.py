@@ -487,6 +487,16 @@ class ChunkedDownload(_request_helpers.RequestsMixin, _download.ChunkedDownload)
         headers (Optional[Mapping[str, str]]): Extra headers that should
             be sent with each request, e.g. headers for data encryption
             key headers.
+        pin_version (Optional[bool]): When :data:`True`, the download is
+            pinned to a single object version. The version (from the
+            ``etag`` response header) is captured from the first chunk and
+            enforced on every later chunk via ``if-match`` request headers
+            and per-response checks before bytes are written. If the
+            version is missing, changes, or the server rejects the
+            condition, the download becomes invalid and only the
+            already-accepted prefix remains in the stream.
+        version (Optional[str]): A known version (``etag`` value) to pin
+            the download to. Passing a value implies ``pin_version=True``.
 
     Attributes:
         media_url (str): The URL containing the media to be downloaded.
@@ -562,6 +572,16 @@ class RawChunkedDownload(_request_helpers.RawRequestsMixin, _download.ChunkedDow
         headers (Optional[Mapping[str, str]]): Extra headers that should
             be sent with each request, e.g. headers for data encryption
             key headers.
+        pin_version (Optional[bool]): When :data:`True`, the download is
+            pinned to a single object version. The version (from the
+            ``etag`` response header) is captured from the first chunk and
+            enforced on every later chunk via ``if-match`` request headers
+            and per-response checks before bytes are written. If the
+            version is missing, changes, or the server rejects the
+            condition, the download becomes invalid and only the
+            already-accepted prefix remains in the stream.
+        version (Optional[str]): A known version (``etag`` value) to pin
+            the download to. Passing a value implies ``pin_version=True``.
 
     Attributes:
         media_url (str): The URL containing the media to be downloaded.

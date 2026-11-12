@@ -610,6 +610,106 @@ class TestChunkedDownload(object):
             timeout=14.7,
         )
 
+    def _versioned_mock_transport(self, chunks, total_bytes, etags):
+        responses = []
+        start = 0
+        for chunk, etag in zip(chunks, etags):
+            response = self._mock_response(
+                start,
+                start + len(chunk) - 1,
+                total_bytes,
+                content=chunk,
+                status_code=int(http.client.PARTIAL_CONTENT),
+            )
+            response._headers["etag"] = etag
+            responses.append(response)
+            start += len(chunk)
+        transport = mock.AsyncMock(spec=["request"])
+        transport.request = mock.AsyncMock(spec=["__call__"], side_effect=responses)
+        return transport
+
+    @pytest.mark.asyncio
+    async def test_consume_next_chunk_version_mismatch(self):
+        # Two chunks of identical length but different version identifiers:
+        # the object was replaced upstream mid-download.
+        chunk1 = b"first half here."
+        chunk2 = b"second half here"
+        assert len(chunk1) == len(chunk2)
+        chunk_size = len(chunk1)
+        total_bytes = chunk_size * 2
+        stream = io.BytesIO()
+        download = download_mod.ChunkedDownload(
+            sync_test.EXAMPLE_URL, chunk_size, stream, pin_version=True
+        )
+        transport = self._versioned_mock_transport(
+            [chunk1, chunk2], total_bytes, ['"v1"', '"v2"']
+        )
+
+        await download.consume_next_chunk(transport)
+        assert stream.getvalue() == chunk1
+        assert download.bytes_downloaded == chunk_size
+
+        # The second chunk is rejected before anything is written.
+        with pytest.raises(common.InvalidResponse):
+            await download.consume_next_chunk(transport)
+
+        # The stream keeps only the accepted prefix and progress stops.
+        assert stream.getvalue() == chunk1
+        assert download.bytes_downloaded == chunk_size
+        assert download.invalid
+        assert not download.finished
+        # The follow-up request was pinned to the first chunk's version.
+        second_call_headers = transport.request.call_args_list[1][1]["headers"]
+        assert second_call_headers["if-match"] == '"v1"'
+
+    @pytest.mark.asyncio
+    async def test_consume_next_chunk_consistent_version(self):
+        # Same length chunks, same version identifier: the full file is
+        # assembled and can be compared byte-for-byte.
+        chunk1 = b"first half here."
+        chunk2 = b"second half here"
+        assert len(chunk1) == len(chunk2)
+        chunk_size = len(chunk1)
+        total_bytes = chunk_size * 2
+        stream = io.BytesIO()
+        download = download_mod.ChunkedDownload(
+            sync_test.EXAMPLE_URL, chunk_size, stream, pin_version=True
+        )
+        transport = self._versioned_mock_transport(
+            [chunk1, chunk2], total_bytes, ['"v1"', '"v1"']
+        )
+
+        await download.consume_next_chunk(transport)
+        await download.consume_next_chunk(transport)
+
+        assert stream.getvalue() == chunk1 + chunk2
+        assert download.bytes_downloaded == total_bytes
+        assert download.finished
+        assert not download.invalid
+
+    @pytest.mark.asyncio
+    async def test_consume_next_chunk_with_known_version(self):
+        chunk1 = b"first half here."
+        chunk2 = b"second half here"
+        chunk_size = len(chunk1)
+        total_bytes = chunk_size * 2
+        stream = io.BytesIO()
+        download = download_mod.ChunkedDownload(
+            sync_test.EXAMPLE_URL, chunk_size, stream, version='"v1"'
+        )
+        transport = self._versioned_mock_transport(
+            [chunk1, chunk2], total_bytes, ['"v1"', '"v1"']
+        )
+
+        await download.consume_next_chunk(transport)
+        await download.consume_next_chunk(transport)
+
+        assert stream.getvalue() == chunk1 + chunk2
+        assert download.finished
+        # Even the first request carried the caller-provided condition.
+        first_call_headers = transport.request.call_args_list[0][1]["headers"]
+        assert first_call_headers["if-match"] == '"v1"'
+
 
 class TestRawChunkedDownload(object):
     @staticmethod
